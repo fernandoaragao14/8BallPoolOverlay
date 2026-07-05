@@ -6,4 +6,9 @@
     <color name="colorBlack">#000000</color>
     <color name="colorGrey">#B4B8B5</color>
     <color name="colorAlphaGrey">#4DB4B8B5</color>
+    <color name="screenBackground">#081D26</color>
+    <color name="panelBackground">#132F39</color>
+    <color name="panelStroke">#2D5D6B</color>
+    <color name="accentGreen">#4DD08A</color>
+    <color name="accentAmber">#FFB44C</color>
 </resources>
