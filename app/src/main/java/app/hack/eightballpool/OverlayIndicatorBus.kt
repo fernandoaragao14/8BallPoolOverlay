@@ -4,30 +4,54 @@ import android.graphics.Color
 import androidx.annotation.ColorInt
 import java.util.concurrent.CopyOnWriteArrayList
 
+/**
+ * Primitivas de desenho que a overlay entende. O detector traduz a jogada
+ * analisada (mesa, bolas, taco, trajetórias) para uma lista destas primitivas.
+ */
 enum class VisualIndicatorShape {
+    /** Círculo (bola detectada, bola principal, marcador de impacto). */
     CIRCLE,
-    BOX,
-    LINE
+
+    /** Retângulo da área jogável da mesa (limites/tabelas). */
+    RECT,
+
+    /** Segmento de reta (trajetória da branca, caminho da bola alvo, rebatida). */
+    LINE,
+
+    /** Ponto pequeno preenchido com rótulo (impacto, ghost ball). */
+    MARKER
 }
 
+/**
+ * Descrição declarativa de um elemento visual sobre a mesa.
+ *
+ * Coordenadas em pixels da tela capturada (mesma escala da overlay em tela cheia).
+ * - CIRCLE: usa [x],[y],[radius].
+ * - RECT: usa [x],[y] (canto superior esquerdo) e [endX],[endY] (canto inferior direito).
+ * - LINE: usa [x],[y] -> [endX],[endY]; [dashed] e [arrow] controlam o estilo.
+ * - MARKER: usa [x],[y] com [radius] pequeno.
+ */
 data class VisualIndicator(
-    val x: Float,
-    val y: Float,
-    val radius: Float = 48f,
-    val label: String? = null,
+    val shape: VisualIndicatorShape,
+    val x: Float = 0f,
+    val y: Float = 0f,
+    val radius: Float = 0f,
+    val endX: Float = 0f,
+    val endY: Float = 0f,
     @ColorInt val color: Int = Color.argb(220, 0, 180, 255),
-    val shape: VisualIndicatorShape = VisualIndicatorShape.CIRCLE,
-    val width: Float = radius * 2f,
-    val height: Float = radius * 2f,
-    val lineEndX: Float? = null,
-    val lineEndY: Float? = null
+    val strokeWidth: Float = 6f,
+    val dashed: Boolean = false,
+    val arrow: Boolean = false,
+    val fill: Boolean = false,
+    val crosshair: Boolean = false,
+    val label: String? = null
 )
 
 /**
- * Canal simples para atualizar os indicadores desenhados pela overlay.
+ * Canal único entre o detector (thread de captura) e a overlay (main thread).
  *
- * O processamento interno chama setIndicators() depois de detectar os elementos
- * redondos e caixas do ERP mobile.
+ * O [ScreenFrameProcessor] chama [setIndicators] após analisar cada frame; a
+ * [IndicatorOverlayService] escuta e redesenha.
  */
 object OverlayIndicatorBus {
 

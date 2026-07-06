@@ -4,622 +4,991 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.SystemClock
 import android.util.Log
-import java.util.ArrayDeque
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Frame pronto para processamento interno.
+ * Analisador visual de jogada de sinuca.
  *
- * Observação: se algum processamento assíncrono precisar guardar o Bitmap,
- * faça uma cópia com bitmap.copy(Bitmap.Config.ARGB_8888, false), porque o
- * processador recicla o frame anterior para evitar crescimento de memória.
- */
-data class CapturedScreenFrame(
-    val bitmap: Bitmap,
-    val timestampMs: Long,
-    val width: Int,
-    val height: Int
-)
-
-/**
- * Processador matricial para detectar botões redondos e caixas de canto no ERP.
+ * Pipeline por frame:
+ * 1. reduz o Bitmap para uma matriz leve (RGB + HSV);
+ * 2. segmenta o pano (HSV) e acha a maior região => área da mesa;
+ * 3. acha bolas como blobs "não-pano" dentro da mesa (tamanho/circularidade);
+ * 4. escolhe a bola branca/principal pela luminância/saturação;
+ * 5. detecta o taco como blob longo e fino (PCA) perto da bola principal;
+ * 6. projeta a trajetória: reta da branca -> 1ª colisão (bola ou tabela);
+ * 7. desenha caminho da bola alvo e/ou rebatida na tabela;
+ * 8. suaviza tudo entre frames e só desenha com confiança suficiente.
  *
- * Pipeline:
- * 1. Reduz o Bitmap para uma matriz leve de luminância.
- * 2. Calcula bordas por Sobel.
- * 3. Agrupa componentes conectados.
- * 4. Pontua componentes circulares e retangulares.
- * 5. Escolhe o círculo principal.
- * 6. Calcula vetores entre o círculo principal e os demais círculos.
- * 7. Prediz colisões em retas usando interseção raio-círculo.
- * 8. Envia círculos, caixas e linhas de colisão para a overlay.
+ * Implementação pura em Kotlin (sem OpenCV) para manter o build simples e
+ * compatível com Android 15/16. Ver [DetectorConfig] para calibração.
  */
 object ScreenFrameProcessor {
 
     private const val TAG = "ScreenFrameProcessor"
-    private const val MAX_ANALYSIS_SIDE = 420
-    private const val MIN_COMPONENT_PIXELS = 18
-    private const val MAX_COMPONENTS = 220
-    private const val MAX_CIRCLES = 14
-    private const val MAX_CORNER_BOXES = 4
-    private const val MAX_COLLISION_LINES = 8
 
-    private val mainCircleColor = Color.argb(235, 255, 193, 7)
-    private val secondaryCircleColor = Color.argb(220, 0, 188, 212)
-    private val collisionLineColor = Color.argb(230, 255, 82, 82)
-    private val impactColor = Color.argb(235, 255, 64, 129)
-    private val cornerBoxColor = Color.argb(220, 156, 39, 176)
+    // Paleta da overlay (ARGB).
+    private val tableColor = Color.argb(200, 0, 230, 190)
+    private val ballColor = Color.argb(220, 120, 200, 255)
+    private val mainBallColor = Color.argb(240, 255, 214, 40)
+    private val aimColor = Color.argb(240, 90, 255, 130)
+    private val impactColor = Color.argb(240, 255, 70, 95)
+    private val targetPathColor = Color.argb(235, 255, 150, 30)
+    private val railBounceColor = Color.argb(225, 190, 120, 255)
+    private val cueDeflectColor = Color.argb(150, 235, 235, 235)
+    private val debugColor = Color.argb(200, 255, 0, 255)
 
     @Volatile
-    private var latestFrame: CapturedScreenFrame? = null
+    private var latestBitmap: Bitmap? = null
 
-    /**
-     * Quando true, roda a detecção matricial padrão e atualiza o OverlayIndicatorBus.
-     */
+    /** Se falso, a overlay não é atualizada (útil para pausar). */
     @Volatile
     var autoDetectEnabled: Boolean = true
 
-    /**
-     * Hook opcional para processamento adicional do app.
-     */
-    @Volatile
-    var listener: ((CapturedScreenFrame) -> Unit)? = null
+    // ---- Estado do tracker temporal (acessado só na thread de captura) --------
+    private val trackedBalls = ArrayList<TrackedBall>()
+    private var nextBallId = 1
+    private var smoothedAimAngle: Float? = null
+    private var smoothedAimConfidence: Float = 0f
+    private var smoothedAimOriginX: Float = 0f
+    private var smoothedAimOriginY: Float = 0f
 
     fun submit(bitmap: Bitmap) {
-        val frame = CapturedScreenFrame(
-            bitmap = bitmap,
-            timestampMs = SystemClock.elapsedRealtime(),
-            width = bitmap.width,
-            height = bitmap.height
-        )
-
-        val previousFrame = synchronized(this) {
-            val previous = latestFrame
-            latestFrame = frame
-            previous
+        val previous = synchronized(this) {
+            val old = latestBitmap
+            latestBitmap = bitmap
+            old
         }
 
         if (autoDetectEnabled) {
-            runCatching { detectAndPublish(frame) }
+            runCatching { detectAndPublish(bitmap) }
                 .onFailure { error ->
                     Log.e(TAG, "Failed to process screen frame", error)
                     OverlayIndicatorBus.clear()
                 }
         }
 
-        listener?.invoke(frame)
-        previousFrame?.bitmap?.recycle()
-    }
-
-    fun latestBitmapCopy(): Bitmap? = synchronized(this) {
-        latestFrame?.bitmap?.copy(Bitmap.Config.ARGB_8888, false)
+        previous?.recycle()
     }
 
     fun clear() {
-        val previousFrame = synchronized(this) {
-            val previous = latestFrame
-            latestFrame = null
-            previous
+        val previous = synchronized(this) {
+            val old = latestBitmap
+            latestBitmap = null
+            old
         }
-        previousFrame?.bitmap?.recycle()
+        previous?.recycle()
+        resetTracking()
         OverlayIndicatorBus.clear()
     }
 
-    private fun detectAndPublish(frame: CapturedScreenFrame) {
-        val matrix = buildAnalysisMatrix(frame.bitmap)
-        val components = detectComponents(matrix)
-        val circles = detectCircles(matrix, components)
-        val cornerBoxes = detectCornerBoxes(matrix, components)
-        val mainCircle = selectMainCircle(circles, frame.width, frame.height)
-        val collisions = predictStraightLineCollisions(mainCircle, circles)
+    private fun resetTracking() {
+        trackedBalls.clear()
+        smoothedAimAngle = null
+        smoothedAimConfidence = 0f
+    }
 
-        val indicators = buildOverlayIndicators(
-            mainCircle = mainCircle,
-            circles = circles,
-            cornerBoxes = cornerBoxes,
-            collisions = collisions
-        )
+    // =====================================================================
+    // Pipeline principal
+    // =====================================================================
+
+    private fun detectAndPublish(bitmap: Bitmap) {
+        val matrix = buildAnalysisMatrix(bitmap)
+        val table = segmentTable(matrix)
+
+        if (table == null) {
+            // Sem mesa confiável: não polui a tela, apenas limpa (mantém último por decaimento do tracker).
+            decayTracking()
+            OverlayIndicatorBus.setIndicators(emptyList())
+            return
+        }
+
+        val notCloth = BooleanArray(matrix.size) { !matrix.cloth[it] }
+        val blobs = labelBlobs(notCloth, matrix)
+
+        val rawBalls = extractBalls(blobs, matrix, table)
+        val emittedBalls = updateBallTracker(rawBalls)
+
+        val cue = detectCue(blobs, matrix, table, emittedBalls)
+
+        // Escolha da bola principal + direção de mira.
+        val play = resolveAim(emittedBalls, cue)
+
+        val indicators = ArrayList<VisualIndicator>()
+        indicators += tableIndicator(table)
+        indicators += ballIndicators(emittedBalls, play?.mainBall)
+
+        if (play != null && smoothedAimConfidence >= DetectorConfig.minAimConfidence) {
+            indicators += trajectoryIndicators(play, emittedBalls, table)
+        }
+
+        if (DetectorConfig.debugOverlay) {
+            indicators += debugIndicators(matrix, table, cue)
+        }
 
         OverlayIndicatorBus.setIndicators(indicators)
     }
 
+    // =====================================================================
+    // 1. Matriz de análise (RGB + HSV + luminância)
+    // =====================================================================
+
     private fun buildAnalysisMatrix(bitmap: Bitmap): AnalysisMatrix {
-        val sampleStep = max(
+        val step = max(
             1,
-            ceil(max(bitmap.width, bitmap.height).toDouble() / MAX_ANALYSIS_SIDE).toInt()
+            ceil(max(bitmap.width, bitmap.height).toDouble() / DetectorConfig.maxAnalysisSide).toInt()
         )
-        val sampledWidth = max(1, ceil(bitmap.width.toDouble() / sampleStep).toInt())
-        val sampledHeight = max(1, ceil(bitmap.height.toDouble() / sampleStep).toInt())
-        val scaleX = bitmap.width.toFloat() / sampledWidth.toFloat()
-        val scaleY = bitmap.height.toFloat() / sampledHeight.toFloat()
+        val w = max(1, bitmap.width / step)
+        val h = max(1, bitmap.height / step)
+        val scaleX = bitmap.width.toFloat() / w
+        val scaleY = bitmap.height.toFloat() / h
 
-        val luminance = IntArray(sampledWidth * sampledHeight)
-        val sourceRow = IntArray(bitmap.width)
+        val hue = FloatArray(w * h)
+        val sat = FloatArray(w * h)
+        val value = FloatArray(w * h)
+        val row = IntArray(bitmap.width)
 
-        for (sampleY in 0 until sampledHeight) {
-            val sourceY = min(bitmap.height - 1, sampleY * sampleStep)
-            bitmap.getPixels(sourceRow, 0, bitmap.width, 0, sourceY, bitmap.width, 1)
-
-            for (sampleX in 0 until sampledWidth) {
-                val sourceX = min(bitmap.width - 1, sampleX * sampleStep)
-                val pixel = sourceRow[sourceX]
-                val red = Color.red(pixel)
-                val green = Color.green(pixel)
-                val blue = Color.blue(pixel)
-                luminance[sampleY * sampledWidth + sampleX] = (red * 77 + green * 150 + blue * 29) shr 8
+        for (y in 0 until h) {
+            val sy = min(bitmap.height - 1, y * step)
+            bitmap.getPixels(row, 0, bitmap.width, 0, sy, bitmap.width, 1)
+            val base = y * w
+            for (x in 0 until w) {
+                val sx = min(bitmap.width - 1, x * step)
+                val p = row[sx]
+                val r = Color.red(p)
+                val g = Color.green(p)
+                val b = Color.blue(p)
+                rgbToHsv(r, g, b, base + x, hue, sat, value)
             }
         }
 
-        val edge = FloatArray(luminance.size)
-        var edgeSum = 0.0
-        var edgeSquareSum = 0.0
-        var measuredEdges = 0
+        return AnalysisMatrix(w, h, scaleX, scaleY, hue, sat, value)
+    }
 
-        for (y in 1 until sampledHeight - 1) {
-            for (x in 1 until sampledWidth - 1) {
-                val top = (y - 1) * sampledWidth
-                val mid = y * sampledWidth
-                val bottom = (y + 1) * sampledWidth
+    private fun rgbToHsv(r: Int, g: Int, b: Int, index: Int, hue: FloatArray, sat: FloatArray, value: FloatArray) {
+        val rf = r / 255f
+        val gf = g / 255f
+        val bf = b / 255f
+        val cMax = max(rf, max(gf, bf))
+        val cMin = min(rf, min(gf, bf))
+        val delta = cMax - cMin
 
-                val gx =
-                    -luminance[top + x - 1] - 2 * luminance[mid + x - 1] - luminance[bottom + x - 1] +
-                        luminance[top + x + 1] + 2 * luminance[mid + x + 1] + luminance[bottom + x + 1]
+        val hDeg = when {
+            delta < 1e-5f -> 0f
+            cMax == rf -> 60f * (((gf - bf) / delta) % 6f)
+            cMax == gf -> 60f * (((bf - rf) / delta) + 2f)
+            else -> 60f * (((rf - gf) / delta) + 4f)
+        }
+        hue[index] = if (hDeg < 0f) hDeg + 360f else hDeg
+        sat[index] = if (cMax <= 1e-5f) 0f else delta / cMax
+        value[index] = cMax
+    }
 
-                val gy =
-                    -luminance[top + x - 1] - 2 * luminance[top + x] - luminance[top + x + 1] +
-                        luminance[bottom + x - 1] + 2 * luminance[bottom + x] + luminance[bottom + x + 1]
+    // =====================================================================
+    // 2. Segmentação da mesa (pano)
+    // =====================================================================
 
-                val strength = abs(gx) + abs(gy)
-                val index = mid + x
-                edge[index] = strength.toFloat()
-                edgeSum += strength.toDouble()
-                edgeSquareSum += strength.toDouble() * strength.toDouble()
-                measuredEdges++
+    private fun segmentTable(matrix: AnalysisMatrix): TableRegion? {
+        val profile = chooseProfile(matrix)
+        val cloth = BooleanArray(matrix.size)
+        var clothCount = 0
+        for (i in 0 until matrix.size) {
+            if (matchesProfile(profile, matrix.hue[i], matrix.sat[i], matrix.value[i])) {
+                cloth[i] = true
+                clothCount++
             }
         }
+        matrix.cloth = cloth
 
-        val edgeMean = if (measuredEdges > 0) edgeSum / measuredEdges else 0.0
-        val edgeVariance = if (measuredEdges > 0) {
-            max(0.0, edgeSquareSum / measuredEdges - edgeMean * edgeMean)
-        } else {
-            0.0
-        }
-        val edgeStd = sqrt(edgeVariance)
-        val edgeThreshold = max(48.0, edgeMean + edgeStd * 0.85)
-        val edgeMask = BooleanArray(edge.size)
+        if (clothCount < matrix.size * DetectorConfig.minTableAreaFraction * 0.5f) return null
 
-        for (index in edge.indices) {
-            edgeMask[index] = edge[index] >= edgeThreshold
-        }
+        // Maior componente de pano = mesa.
+        val largest = largestComponent(cloth, matrix) ?: return null
+        val areaFraction = largest.count.toFloat() / matrix.size
+        if (areaFraction < DetectorConfig.minTableAreaFraction) return null
 
-        return AnalysisMatrix(
-            width = sampledWidth,
-            height = sampledHeight,
-            scaleX = scaleX,
-            scaleY = scaleY,
-            luminance = luminance,
-            edge = edge,
-            edgeMask = edgeMask
+        val left = largest.minX * matrix.scaleX
+        val top = largest.minY * matrix.scaleY
+        val right = (largest.maxX + 1) * matrix.scaleX
+        val bottom = (largest.maxY + 1) * matrix.scaleY
+        val inset = (right - left) * DetectorConfig.railInsetFraction
+
+        return TableRegion(
+            sampledMinX = largest.minX,
+            sampledMinY = largest.minY,
+            sampledMaxX = largest.maxX,
+            sampledMaxY = largest.maxY,
+            left = left,
+            top = top,
+            right = right,
+            bottom = bottom,
+            playLeft = left + inset,
+            playTop = top + inset,
+            playRight = right - inset,
+            playBottom = bottom - inset,
+            profile = profile
         )
     }
 
-    private fun detectComponents(matrix: AnalysisMatrix): List<Component> {
-        val visited = BooleanArray(matrix.edgeMask.size)
-        val components = mutableListOf<Component>()
-        val queue = ArrayDeque<Int>()
+    private fun chooseProfile(matrix: AnalysisMatrix): DetectorConfig.ClothProfile {
+        if (DetectorConfig.clothProfile != DetectorConfig.ClothProfile.AUTO) {
+            return DetectorConfig.clothProfile
+        }
+        var green = 0
+        var blue = 0
+        var gray = 0
+        for (i in 0 until matrix.size) {
+            val hh = matrix.hue[i]
+            val ss = matrix.sat[i]
+            val vv = matrix.value[i]
+            if (matchesProfile(DetectorConfig.ClothProfile.GREEN, hh, ss, vv)) green++
+            if (matchesProfile(DetectorConfig.ClothProfile.BLUE, hh, ss, vv)) blue++
+            if (matchesProfile(DetectorConfig.ClothProfile.GRAY, hh, ss, vv)) gray++
+        }
+        return when {
+            green >= blue && green >= gray -> DetectorConfig.ClothProfile.GREEN
+            blue >= green && blue >= gray -> DetectorConfig.ClothProfile.BLUE
+            else -> DetectorConfig.ClothProfile.GRAY
+        }
+    }
 
-        for (startIndex in matrix.edgeMask.indices) {
-            if (visited[startIndex] || !matrix.edgeMask[startIndex]) continue
+    private fun matchesProfile(profile: DetectorConfig.ClothProfile, h: Float, s: Float, v: Float): Boolean {
+        return when (profile) {
+            DetectorConfig.ClothProfile.GREEN ->
+                h in DetectorConfig.greenHueRange && s >= DetectorConfig.greenMinSat &&
+                    v in DetectorConfig.greenValRange
+            DetectorConfig.ClothProfile.BLUE ->
+                h in DetectorConfig.blueHueRange && s >= DetectorConfig.blueMinSat &&
+                    v in DetectorConfig.blueValRange
+            DetectorConfig.ClothProfile.GRAY ->
+                s <= DetectorConfig.grayMaxSat && v in DetectorConfig.grayValRange
+            DetectorConfig.ClothProfile.AUTO -> false
+        }
+    }
 
-            val points = ArrayList<Int>()
+    // =====================================================================
+    // 3. Blobs (componentes conectados) + momentos para PCA
+    // =====================================================================
+
+    private fun labelBlobs(mask: BooleanArray, matrix: AnalysisMatrix): List<Blob> {
+        val w = matrix.width
+        val h = matrix.height
+        val visited = BooleanArray(mask.size)
+        val stack = IntArray(mask.size)
+        val blobs = ArrayList<Blob>()
+
+        for (start in mask.indices) {
+            if (visited[start] || !mask[start]) continue
+
+            var sp = 0
+            stack[sp++] = start
+            visited[start] = true
+
+            var count = 0L
+            var sumX = 0.0
+            var sumY = 0.0
+            var sumXX = 0.0
+            var sumYY = 0.0
+            var sumXY = 0.0
+            var sumSat = 0.0
+            var sumVal = 0.0
             var minX = Int.MAX_VALUE
             var minY = Int.MAX_VALUE
             var maxX = Int.MIN_VALUE
             var maxY = Int.MIN_VALUE
-            var sumX = 0L
-            var sumY = 0L
 
-            visited[startIndex] = true
-            queue.add(startIndex)
+            while (sp > 0) {
+                val idx = stack[--sp]
+                val x = idx % w
+                val y = idx / w
 
-            while (queue.isNotEmpty()) {
-                val index = queue.removeFirst()
-                points.add(index)
+                count++
+                sumX += x
+                sumY += y
+                sumXX += (x * x).toDouble()
+                sumYY += (y * y).toDouble()
+                sumXY += (x * y).toDouble()
+                sumSat += matrix.sat[idx]
+                sumVal += matrix.value[idx]
+                if (x < minX) minX = x
+                if (y < minY) minY = y
+                if (x > maxX) maxX = x
+                if (y > maxY) maxY = y
 
-                val x = index % matrix.width
-                val y = index / matrix.width
+                if (x > 0) { val n = idx - 1; if (!visited[n] && mask[n]) { visited[n] = true; stack[sp++] = n } }
+                if (x < w - 1) { val n = idx + 1; if (!visited[n] && mask[n]) { visited[n] = true; stack[sp++] = n } }
+                if (y > 0) { val n = idx - w; if (!visited[n] && mask[n]) { visited[n] = true; stack[sp++] = n } }
+                if (y < h - 1) { val n = idx + w; if (!visited[n] && mask[n]) { visited[n] = true; stack[sp++] = n } }
+            }
 
-                minX = min(minX, x)
-                minY = min(minY, y)
-                maxX = max(maxX, x)
-                maxY = max(maxY, y)
-                sumX += x.toLong()
-                sumY += y.toLong()
+            blobs.add(
+                Blob(
+                    count = count,
+                    centerX = (sumX / count).toFloat(),
+                    centerY = (sumY / count).toFloat(),
+                    covXX = (sumXX / count - (sumX / count) * (sumX / count)).toFloat(),
+                    covYY = (sumYY / count - (sumY / count) * (sumY / count)).toFloat(),
+                    covXY = (sumXY / count - (sumX / count) * (sumY / count)).toFloat(),
+                    meanSat = (sumSat / count).toFloat(),
+                    meanVal = (sumVal / count).toFloat(),
+                    minX = minX,
+                    minY = minY,
+                    maxX = maxX,
+                    maxY = maxY
+                )
+            )
+        }
 
-                val fromY = max(1, y - 1)
-                val toY = min(matrix.height - 2, y + 1)
-                val fromX = max(1, x - 1)
-                val toX = min(matrix.width - 2, x + 1)
+        return blobs
+    }
 
-                for (ny in fromY..toY) {
-                    for (nx in fromX..toX) {
-                        if (nx == x && ny == y) continue
-                        val neighborIndex = ny * matrix.width + nx
-                        if (!visited[neighborIndex] && matrix.edgeMask[neighborIndex]) {
-                            visited[neighborIndex] = true
-                            queue.add(neighborIndex)
-                        }
-                    }
+    private fun largestComponent(mask: BooleanArray, matrix: AnalysisMatrix): Blob? {
+        return labelBlobs(mask, matrix).maxByOrNull { it.count }
+    }
+
+    // =====================================================================
+    // 4. Bolas
+    // =====================================================================
+
+    private fun extractBalls(blobs: List<Blob>, matrix: AnalysisMatrix, table: TableRegion): List<DetectedBall> {
+        val avgScale = (matrix.scaleX + matrix.scaleY) / 2f
+        val tableWidth = table.right - table.left
+        val minR = DetectorConfig.minBallRadiusFraction * tableWidth
+        val maxR = DetectorConfig.maxBallRadiusFraction * tableWidth
+
+        val balls = ArrayList<DetectedBall>()
+        for (blob in blobs) {
+            // Deve estar estritamente dentro da mesa (exclui tabelas, caçapas e fundo).
+            if (blob.minX <= table.sampledMinX + 1 || blob.maxX >= table.sampledMaxX - 1) continue
+            if (blob.minY <= table.sampledMinY + 1 || blob.maxY >= table.sampledMaxY - 1) continue
+
+            val bw = (blob.maxX - blob.minX + 1)
+            val bh = (blob.maxY - blob.minY + 1)
+            val aspect = max(bw, bh).toFloat() / max(1, min(bw, bh))
+            if (aspect > DetectorConfig.ballMaxAspect) continue
+
+            val circularity = blob.count.toFloat() / (bw * bh)
+            if (circularity < DetectorConfig.ballMinCircularity) continue
+
+            val radiusSampled = sqrt(blob.count / Math.PI).toFloat()
+            val radius = radiusSampled * avgScale
+            if (radius < minR || radius > maxR) continue
+
+            balls.add(
+                DetectedBall(
+                    x = blob.centerX * matrix.scaleX,
+                    y = blob.centerY * matrix.scaleY,
+                    radius = radius,
+                    whiteness = blob.meanVal * (1f - blob.meanSat)
+                )
+            )
+        }
+
+        return balls.sortedByDescending { it.radius }.take(DetectorConfig.maxBalls)
+    }
+
+    // =====================================================================
+    // 5. Taco (blob longo e fino via PCA)
+    // =====================================================================
+
+    private fun detectCue(
+        blobs: List<Blob>,
+        matrix: AnalysisMatrix,
+        table: TableRegion,
+        balls: List<TrackedBall>
+    ): CueLine? {
+        val cueBall = balls.maxByOrNull { it.whiteness }
+            ?.takeIf { it.whiteness >= DetectorConfig.cueBallMinValue * (1f - DetectorConfig.cueBallMaxSat) }
+        // Referência de raio para a busca: bola branca, senão mediana das bolas.
+        val refRadius = cueBall?.radius
+            ?: balls.map { it.radius }.sortedOrNull()
+            ?: return null
+        val avgScale = (matrix.scaleX + matrix.scaleY) / 2f
+        val searchRadius = DetectorConfig.cueSearchRadiusBallFactor * refRadius
+        val maxOffset = DetectorConfig.cueMaxOffsetBallFactor * refRadius
+
+        // Ponto de referência (em px originais) para achar o taco: bola branca ou centro das bolas.
+        val refX = cueBall?.x ?: balls.map { it.x }.average().toFloat()
+        val refY = cueBall?.y ?: balls.map { it.y }.average().toFloat()
+
+        var best: CueLine? = null
+        var bestScore = 0f
+
+        for (blob in blobs) {
+            if (blob.count < DetectorConfig.cueMinPixels) continue
+            if (blob.count > matrix.size * 0.10f) continue // fundo/UI grande não é taco
+
+            val eig = principalAxis(blob) ?: continue
+            if (eig.elongation < DetectorConfig.cueMinElongation) continue
+
+            val cx = blob.centerX * matrix.scaleX
+            val cy = blob.centerY * matrix.scaleY
+            // Vetor principal em px originais (renormalizado para lidar com scaleX!=scaleY).
+            var vx = eig.dirX * matrix.scaleX
+            var vy = eig.dirY * matrix.scaleY
+            val vn = hypot(vx.toDouble(), vy.toDouble()).toFloat()
+            if (vn < 1e-3f) continue
+            vx /= vn
+            vy /= vn
+
+            // Distância perpendicular da referência ao eixo do taco.
+            val rx = refX - cx
+            val ry = refY - cy
+            val proj = rx * vx + ry * vy
+            val perp = abs(rx * (-vy) + ry * vx)
+            if (perp > maxOffset) continue
+
+            // A bola precisa estar perto de uma das pontas do taco.
+            val halfLen = 2f * sqrt(max(0f, eig.lambda1)) * avgScale
+            val endA = floatArrayOf(cx + vx * halfLen, cy + vy * halfLen)
+            val endB = floatArrayOf(cx - vx * halfLen, cy - vy * halfLen)
+            val nearEnd = min(dist(refX, refY, endA[0], endA[1]), dist(refX, refY, endB[0], endB[1]))
+            if (nearEnd > searchRadius) continue
+
+            // Orienta a mira: da ponta atrás da bola PARA a bola e além.
+            val aimSign = if (proj >= 0f) 1f else -1f
+            val aimX = vx * aimSign
+            val aimY = vy * aimSign
+
+            val elongScore = ((eig.elongation - DetectorConfig.cueMinElongation) / 6f).coerceIn(0f, 1f)
+            val perpScore = (1f - perp / maxOffset).coerceIn(0f, 1f)
+            val nearScore = (1f - nearEnd / searchRadius).coerceIn(0f, 1f)
+            val score = 0.4f * elongScore + 0.35f * perpScore + 0.25f * nearScore
+
+            if (score > bestScore) {
+                bestScore = score
+                best = CueLine(
+                    axisX = cx,
+                    axisY = cy,
+                    aimX = aimX,
+                    aimY = aimY,
+                    confidence = score,
+                    cueBall = cueBall
+                )
+            }
+        }
+
+        return best
+    }
+
+    private fun principalAxis(blob: Blob): EigenAxis? {
+        val a = blob.covXX
+        val b = blob.covXY
+        val d = blob.covYY
+        val trace = a + d
+        val det = a * d - b * b
+        val disc = trace * trace / 4f - det
+        if (disc < 0f) return null
+        val root = sqrt(disc)
+        val l1 = trace / 2f + root
+        val l2 = trace / 2f - root
+        if (l1 <= 1e-4f || l2 <= 1e-5f) return null
+
+        // Autovetor de l1.
+        val ex: Float
+        val ey: Float
+        if (abs(b) > 1e-5f) {
+            ex = l1 - d
+            ey = b
+        } else {
+            if (a >= d) { ex = 1f; ey = 0f } else { ex = 0f; ey = 1f }
+        }
+        val n = hypot(ex.toDouble(), ey.toDouble()).toFloat()
+        return EigenAxis(ex / n, ey / n, l1, l2, sqrt(l1 / l2))
+    }
+
+    // =====================================================================
+    // 6-7. Mira, trajetória e geometria
+    // =====================================================================
+
+    private fun resolveAim(balls: List<TrackedBall>, cue: CueLine?): PlayResolution? {
+        if (balls.isEmpty()) {
+            decayTracking()
+            return null
+        }
+
+        // Caso 1: taco detectado -> bola principal é a melhor alinhada à frente do taco.
+        if (cue != null) {
+            val main = cue.cueBall ?: bestAlignedBall(balls, cue.axisX, cue.axisY, cue.aimX, cue.aimY)
+            if (main != null) {
+                updateAim(main.x, main.y, cue.aimX, cue.aimY, cue.confidence)
+                return currentPlay(main)
+            }
+        }
+
+        // Caso 2: sem taco, mas há bola branca -> fallback por alinhamento (confiança baixa).
+        val white = balls.maxByOrNull { it.whiteness }
+            ?.takeIf { it.whiteness >= DetectorConfig.cueBallMinValue * (1f - DetectorConfig.cueBallMaxSat) }
+        if (white != null) {
+            val nearest = balls.filter { it !== white }.minByOrNull { dist(white.x, white.y, it.x, it.y) }
+            if (nearest != null) {
+                val dx = nearest.x - white.x
+                val dy = nearest.y - white.y
+                val n = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                if (n > 1f) {
+                    updateAim(white.x, white.y, dx / n, dy / n, 0.22f)
+                    return currentPlay(white)
                 }
             }
-
-            if (points.size >= MIN_COMPONENT_PIXELS) {
-                components.add(
-                    Component(
-                        points = points.toIntArray(),
-                        minX = minX,
-                        minY = minY,
-                        maxX = maxX,
-                        maxY = maxY,
-                        sumX = sumX,
-                        sumY = sumY
-                    )
-                )
-            }
-
-            if (components.size >= MAX_COMPONENTS) break
+            updateAim(white.x, white.y, 0f, 0f, 0f)
+            return currentPlay(white)
         }
 
-        return components
+        decayTracking()
+        return null
     }
 
-    private fun detectCircles(matrix: AnalysisMatrix, components: List<Component>): List<CircleCandidate> {
-        val candidates = mutableListOf<CircleCandidate>()
-        val maxCircleSide = min(matrix.width, matrix.height) * 0.45f
-
-        components.forEach { component ->
-            val boxWidth = component.width
-            val boxHeight = component.height
-            val minSide = min(boxWidth, boxHeight)
-            val maxSide = max(boxWidth, boxHeight)
-
-            if (minSide < 6 || maxSide > maxCircleSide) return@forEach
-
-            val aspectScore = minSide.toFloat() / maxSide.toFloat()
-            if (aspectScore < 0.66f) return@forEach
-
-            val centerX = component.sumX.toFloat() / component.points.size.toFloat()
-            val centerY = component.sumY.toFloat() / component.points.size.toFloat()
-            val radius = (boxWidth + boxHeight) / 4f
-            if (radius <= 0f) return@forEach
-
-            var radialError = 0f
-            component.points.forEach { point ->
-                val x = point % matrix.width
-                val y = point / matrix.width
-                radialError += abs(hypot((x - centerX).toDouble(), (y - centerY).toDouble()).toFloat() - radius)
-            }
-
-            val normalizedRadialError = radialError / (component.points.size.toFloat() * max(1f, radius))
-            if (normalizedRadialError > 0.42f) return@forEach
-
-            val perimeter = (2.0 * Math.PI * radius).toFloat()
-            val edgeDensity = component.points.size.toFloat() / max(1f, perimeter)
-            val radialScore = (1f - normalizedRadialError * 1.65f).coerceIn(0f, 1f)
-            val densityScore = (edgeDensity / 1.65f).coerceIn(0.25f, 1f)
-            val score = aspectScore * radialScore * densityScore
-
-            val originalRadius = radius * ((matrix.scaleX + matrix.scaleY) / 2f)
-            if (score < 0.28f || originalRadius < 18f || originalRadius > 260f) return@forEach
-
-            candidates.add(
-                CircleCandidate(
-                    x = centerX * matrix.scaleX,
-                    y = centerY * matrix.scaleY,
-                    radius = originalRadius,
-                    score = score
-                )
-            )
-        }
-
-        return suppressOverlappingCircles(candidates)
-            .sortedWith(compareByDescending<CircleCandidate> { it.score * it.radius })
-            .take(MAX_CIRCLES)
-    }
-
-    private fun suppressOverlappingCircles(circles: List<CircleCandidate>): List<CircleCandidate> {
-        val selected = mutableListOf<CircleCandidate>()
-        circles.sortedWith(compareByDescending<CircleCandidate> { it.score * it.radius }).forEach { circle ->
-            val overlaps = selected.any { existing ->
-                distance(circle.x, circle.y, existing.x, existing.y) < max(circle.radius, existing.radius) * 0.65f
-            }
-            if (!overlaps) selected.add(circle)
-        }
-        return selected
-    }
-
-    private fun detectCornerBoxes(matrix: AnalysisMatrix, components: List<Component>): List<CornerBoxCandidate> {
-        val cornerZoneX = matrix.width * 0.30f
-        val cornerZoneY = matrix.height * 0.30f
-        val candidates = mutableListOf<CornerBoxCandidate>()
-
-        components.forEach { component ->
-            val boxWidth = component.width
-            val boxHeight = component.height
-            val minSide = min(boxWidth, boxHeight)
-            val maxSide = max(boxWidth, boxHeight)
-
-            if (minSide < 8 || maxSide < 16) return@forEach
-            if (maxSide > max(matrix.width, matrix.height) * 0.45f) return@forEach
-
-            val centerX = (component.minX + component.maxX) / 2f
-            val centerY = (component.minY + component.maxY) / 2f
-            val nearCorner =
-                (centerX <= cornerZoneX && centerY <= cornerZoneY) ||
-                    (centerX >= matrix.width - cornerZoneX && centerY <= cornerZoneY) ||
-                    (centerX <= cornerZoneX && centerY >= matrix.height - cornerZoneY) ||
-                    (centerX >= matrix.width - cornerZoneX && centerY >= matrix.height - cornerZoneY)
-
-            if (!nearCorner) return@forEach
-
-            val perimeter = 2f * (boxWidth + boxHeight)
-            val edgeDensity = component.points.size.toFloat() / max(1f, perimeter)
-            val aspect = minSide.toFloat() / maxSide.toFloat()
-            val score = (edgeDensity / 1.4f).coerceIn(0f, 1f) * (0.45f + aspect * 0.55f)
-
-            if (score < 0.22f) return@forEach
-
-            candidates.add(
-                CornerBoxCandidate(
-                    x = centerX * matrix.scaleX,
-                    y = centerY * matrix.scaleY,
-                    width = boxWidth * matrix.scaleX,
-                    height = boxHeight * matrix.scaleY,
-                    score = score
-                )
-            )
-        }
-
-        return candidates
-            .sortedByDescending { it.score * it.width * it.height }
-            .take(MAX_CORNER_BOXES)
-    }
-
-    private fun selectMainCircle(
-        circles: List<CircleCandidate>,
-        frameWidth: Int,
-        frameHeight: Int
-    ): CircleCandidate? {
-        if (circles.isEmpty()) return null
-
-        val screenCenterX = frameWidth / 2f
-        val screenCenterY = frameHeight / 2f
-        val maxCenterDistance = hypot(screenCenterX.toDouble(), screenCenterY.toDouble()).toFloat()
-
-        return circles.maxByOrNull { circle ->
-            val centerDistance = distance(circle.x, circle.y, screenCenterX, screenCenterY)
-            val centrality = 1f - (centerDistance / max(1f, maxCenterDistance)).coerceIn(0f, 1f)
-            circle.radius * 1.35f + circle.score * 120f + centrality * 45f
+    private fun bestAlignedBall(
+        balls: List<TrackedBall>,
+        axisX: Float,
+        axisY: Float,
+        aimX: Float,
+        aimY: Float
+    ): TrackedBall? {
+        return balls.filter { ball ->
+            (ball.x - axisX) * aimX + (ball.y - axisY) * aimY > 0f // à frente do taco
+        }.minByOrNull { ball ->
+            abs((ball.x - axisX) * (-aimY) + (ball.y - axisY) * aimX) // menor distância perpendicular
         }
     }
 
-    private fun predictStraightLineCollisions(
-        mainCircle: CircleCandidate?,
-        circles: List<CircleCandidate>
-    ): List<CollisionCandidate> {
-        val main = mainCircle ?: return emptyList()
-        val targets = circles.filterNot { it === main }
-        val collisions = mutableListOf<CollisionCandidate>()
-
-        targets.forEach { target ->
-            val directionX = target.x - main.x
-            val directionY = target.y - main.y
-            val totalDistance = hypot(directionX.toDouble(), directionY.toDouble()).toFloat()
-            if (totalDistance <= 1f) return@forEach
-
-            val unitX = directionX / totalDistance
-            val unitY = directionY / totalDistance
-
-            val firstHit = targets.mapNotNull { obstacle ->
-                intersectMovingCircleWithObstacle(
-                    main = main,
-                    obstacle = obstacle,
-                    unitX = unitX,
-                    unitY = unitY,
-                    maxDistance = totalDistance
-                )
-            }.minByOrNull { it.travelDistance }
-
-            firstHit?.let { collisions.add(it) }
+    /** Atualiza a mira suavizada (EMA no ângulo) e a confiança. */
+    private fun updateAim(originX: Float, originY: Float, dirX: Float, dirY: Float, confidence: Float) {
+        smoothedAimOriginX = originX
+        smoothedAimOriginY = originY
+        if (confidence <= 0f || (dirX == 0f && dirY == 0f)) {
+            smoothedAimConfidence *= 0.6f
+            return
         }
-
-        return collisions
-            .sortedBy { it.travelDistance }
-            .distinctBy { collision ->
-                "${(collision.target.x / 24f).roundToInt()}:${(collision.target.y / 24f).roundToInt()}"
-            }
-            .take(MAX_COLLISION_LINES)
+        val angle = atan2(dirY.toDouble(), dirX.toDouble()).toFloat()
+        val current = smoothedAimAngle
+        smoothedAimAngle = if (current == null) {
+            angle
+        } else {
+            current + DetectorConfig.aimSmoothing * angleDelta(angle, current)
+        }
+        smoothedAimConfidence = smoothedAimConfidence + 0.5f * (confidence - smoothedAimConfidence)
+        if (smoothedAimConfidence < confidence) smoothedAimConfidence = confidence
     }
 
-    private fun intersectMovingCircleWithObstacle(
-        main: CircleCandidate,
-        obstacle: CircleCandidate,
-        unitX: Float,
-        unitY: Float,
-        maxDistance: Float
-    ): CollisionCandidate? {
-        val relativeX = obstacle.x - main.x
-        val relativeY = obstacle.y - main.y
-        val projection = relativeX * unitX + relativeY * unitY
-
-        if (projection <= main.radius || projection > maxDistance + obstacle.radius) return null
-
-        val relativeDistanceSquared = relativeX * relativeX + relativeY * relativeY
-        val closestDistanceSquared = relativeDistanceSquared - projection * projection
-        val expandedRadius = main.radius + obstacle.radius
-        val expandedRadiusSquared = expandedRadius * expandedRadius
-
-        if (closestDistanceSquared > expandedRadiusSquared) return null
-
-        val travelDistance = projection - sqrt(max(0f, expandedRadiusSquared - closestDistanceSquared))
-        if (travelDistance < main.radius || travelDistance > maxDistance) return null
-
-        val startX = main.x + unitX * main.radius
-        val startY = main.y + unitY * main.radius
-        val impactX = main.x + unitX * travelDistance
-        val impactY = main.y + unitY * travelDistance
-        val clearance = projection - expandedRadius
-
-        return CollisionCandidate(
-            startX = startX,
-            startY = startY,
-            impactX = impactX,
-            impactY = impactY,
-            travelDistance = travelDistance,
-            clearance = clearance,
-            target = obstacle
-        )
+    private fun decayTracking() {
+        smoothedAimConfidence *= 0.6f
     }
 
-    private fun buildOverlayIndicators(
-        mainCircle: CircleCandidate?,
-        circles: List<CircleCandidate>,
-        cornerBoxes: List<CornerBoxCandidate>,
-        collisions: List<CollisionCandidate>
+    private fun currentPlay(main: TrackedBall): PlayResolution {
+        val angle = smoothedAimAngle ?: 0f
+        return PlayResolution(main, cos(angle.toDouble()).toFloat(), sin(angle.toDouble()).toFloat())
+    }
+
+    private fun trajectoryIndicators(
+        play: PlayResolution,
+        balls: List<TrackedBall>,
+        table: TableRegion
     ): List<VisualIndicator> {
-        val indicators = mutableListOf<VisualIndicator>()
+        val out = ArrayList<VisualIndicator>()
+        val main = play.mainBall
+        val ox = main.x
+        val oy = main.y
+        val dx = play.aimX
+        val dy = play.aimY
+        if (dx == 0f && dy == 0f) return out
 
-        cornerBoxes.forEachIndexed { index, box ->
-            indicators.add(
-                VisualIndicator(
-                    x = box.x,
-                    y = box.y,
-                    radius = 14f,
-                    label = "Caixa ${index + 1}",
-                    color = cornerBoxColor,
-                    shape = VisualIndicatorShape.BOX,
-                    width = box.width,
-                    height = box.height
-                )
-            )
+        val others = balls.filter { it !== main }
+
+        // 1ª colisão com bola.
+        var ballHitT = Float.MAX_VALUE
+        var hitBall: TrackedBall? = null
+        for (b in others) {
+            val t = rayCircle(ox, oy, dx, dy, b.x, b.y, main.radius + b.radius)
+            if (t != null && t < ballHitT) {
+                ballHitT = t
+                hitBall = b
+            }
         }
 
-        mainCircle?.let { main ->
-            indicators.add(
-                VisualIndicator(
-                    x = main.x,
-                    y = main.y,
-                    radius = main.radius,
-                    label = "Principal",
-                    color = mainCircleColor,
-                    shape = VisualIndicatorShape.CIRCLE
-                )
+        // 1ª colisão com a tabela (centro a `radius` da borda).
+        val railHit = rayRect(ox, oy, dx, dy, table, main.radius)
+
+        val ballFirst = hitBall != null && ballHitT <= (railHit?.t ?: Float.MAX_VALUE)
+
+        if (ballFirst && hitBall != null) {
+            val contactX = ox + dx * ballHitT
+            val contactY = oy + dy * ballHitT
+            out += lineIndicator(ox, oy, contactX, contactY, aimColor, 9f, arrow = false, label = "Mira")
+
+            // Ponto de impacto (onde as bolas se tocam).
+            var ux = hitBall.x - contactX
+            var uy = hitBall.y - contactY
+            val un = hypot(ux.toDouble(), uy.toDouble()).toFloat()
+            if (un > 1e-3f) { ux /= un; uy /= un }
+            val touchX = contactX + ux * main.radius
+            val touchY = contactY + uy * main.radius
+            out += VisualIndicator(
+                shape = VisualIndicatorShape.MARKER,
+                x = touchX, y = touchY, radius = 12f, color = impactColor, label = "Impacto"
             )
-        }
+            // Ghost ball (posição da branca no impacto).
+            out += VisualIndicator(
+                shape = VisualIndicatorShape.CIRCLE,
+                x = contactX, y = contactY, radius = main.radius,
+                color = withAlpha(aimColor, 130), strokeWidth = 4f
+            )
 
-        circles.filterNot { it === mainCircle }
-            .take(8)
-            .forEachIndexed { index, circle ->
-                val label = mainCircle?.let { main ->
-                    val distance = distance(main.x, main.y, circle.x, circle.y).roundToInt()
-                    "C${index + 1} ${distance}px"
-                } ?: "C${index + 1}"
-
-                indicators.add(
-                    VisualIndicator(
-                        x = circle.x,
-                        y = circle.y,
-                        radius = circle.radius,
-                        label = label,
-                        color = secondaryCircleColor,
-                        shape = VisualIndicatorShape.CIRCLE
-                    )
-                )
+            // Caminho provável da bola alvo até a tabela (+1 rebatida).
+            val targetRail = rayRect(hitBall.x, hitBall.y, ux, uy, table, hitBall.radius)
+            if (targetRail != null) {
+                val tx = hitBall.x + ux * targetRail.t
+                val ty = hitBall.y + uy * targetRail.t
+                out += lineIndicator(hitBall.x, hitBall.y, tx, ty, targetPathColor, 8f, arrow = true, dashed = true)
+                addRailBounces(out, tx, ty, ux, uy, targetRail.normalX, targetRail.normalY, table, hitBall.radius, targetPathColor)
+            } else {
+                out += lineIndicator(hitBall.x, hitBall.y, hitBall.x + ux * 400f, hitBall.y + uy * 400f, targetPathColor, 8f, arrow = true, dashed = true)
             }
 
-        collisions.forEachIndexed { index, collision ->
-            indicators.add(
-                VisualIndicator(
-                    x = collision.startX,
-                    y = collision.startY,
-                    radius = 8f,
-                    label = "Reta ${index + 1}: ${collision.travelDistance.roundToInt()}px",
-                    color = collisionLineColor,
-                    shape = VisualIndicatorShape.LINE,
-                    lineEndX = collision.impactX,
-                    lineEndY = collision.impactY
-                )
+            // Deflexão aproximada da branca (perpendicular à linha de impacto).
+            if (DetectorConfig.drawCueDeflection) {
+                var tvx = dx - (dx * ux + dy * uy) * ux
+                var tvy = dy - (dx * ux + dy * uy) * uy
+                val tvn = hypot(tvx.toDouble(), tvy.toDouble()).toFloat()
+                if (tvn > 1e-3f) {
+                    tvx /= tvn; tvy /= tvn
+                    val len = main.radius * 4f
+                    out += lineIndicator(contactX, contactY, contactX + tvx * len, contactY + tvy * len, cueDeflectColor, 5f, arrow = true, dashed = true)
+                }
+            }
+        } else if (railHit != null) {
+            val ix = ox + dx * railHit.t
+            val iy = oy + dy * railHit.t
+            out += lineIndicator(ox, oy, ix, iy, aimColor, 9f, arrow = false, label = "Mira")
+            out += VisualIndicator(
+                shape = VisualIndicatorShape.MARKER,
+                x = ix, y = iy, radius = 12f, color = impactColor, label = "Tabela"
             )
-            indicators.add(
-                VisualIndicator(
-                    x = collision.impactX,
-                    y = collision.impactY,
-                    radius = 18f,
-                    label = "Impacto",
-                    color = impactColor,
-                    shape = VisualIndicatorShape.CIRCLE
-                )
+            addRailBounces(out, ix, iy, dx, dy, railHit.normalX, railHit.normalY, table, main.radius, railBounceColor)
+        }
+
+        return out
+    }
+
+    private fun addRailBounces(
+        out: ArrayList<VisualIndicator>,
+        startX: Float,
+        startY: Float,
+        inX: Float,
+        inY: Float,
+        normalX: Float,
+        normalY: Float,
+        table: TableRegion,
+        radius: Float,
+        color: Int
+    ) {
+        var px = startX
+        var py = startY
+        val firstReflected = reflect(inX, inY, normalX, normalY)
+        var dirX = firstReflected.first
+        var dirY = firstReflected.second
+
+        var bounces = 0
+        while (bounces < DetectorConfig.maxRailReflections) {
+            val hit = rayRect(px, py, dirX, dirY, table, radius) ?: run {
+                out += lineIndicator(px, py, px + dirX * 400f, py + dirY * 400f, color, 7f, arrow = true, dashed = true)
+                return
+            }
+            val nx = px + dirX * hit.t
+            val ny = py + dirY * hit.t
+            out += lineIndicator(px, py, nx, ny, color, 7f, arrow = true, dashed = true)
+            val reflected = reflect(dirX, dirY, hit.normalX, hit.normalY)
+            px = nx; py = ny
+            dirX = reflected.first; dirY = reflected.second
+            bounces++
+        }
+    }
+
+    // ---- Interseções -----------------------------------------------------------
+
+    /** Menor t>0 em que um círculo de raio [combinedRadius] centrado em (cx,cy) é atingido pelo raio (ox,oy)+t*(dx,dy). */
+    private fun rayCircle(
+        ox: Float, oy: Float, dx: Float, dy: Float,
+        cx: Float, cy: Float, combinedRadius: Float
+    ): Float? {
+        val relX = cx - ox
+        val relY = cy - oy
+        val proj = relX * dx + relY * dy
+        if (proj <= 0f) return null
+        val perp2 = (relX * relX + relY * relY) - proj * proj
+        val r2 = combinedRadius * combinedRadius
+        if (perp2 > r2) return null
+        val t = proj - sqrt(r2 - perp2)
+        return if (t > 0f) t else null
+    }
+
+    /** Interseção do centro da bola (offset [radius] das bordas) com o retângulo jogável. */
+    private fun rayRect(
+        ox: Float, oy: Float, dx: Float, dy: Float,
+        table: TableRegion, radius: Float
+    ): RailHit? {
+        val left = table.playLeft + radius
+        val right = table.playRight - radius
+        val top = table.playTop + radius
+        val bottom = table.playBottom - radius
+
+        var bestT = Float.MAX_VALUE
+        var nx = 0f
+        var ny = 0f
+
+        if (dx < 0f) { // parede esquerda
+            val t = (left - ox) / dx
+            if (t > 1e-3f) {
+                val y = oy + dy * t
+                if (y in top..bottom && t < bestT) { bestT = t; nx = 1f; ny = 0f }
+            }
+        } else if (dx > 0f) { // parede direita
+            val t = (right - ox) / dx
+            if (t > 1e-3f) {
+                val y = oy + dy * t
+                if (y in top..bottom && t < bestT) { bestT = t; nx = -1f; ny = 0f }
+            }
+        }
+        if (dy < 0f) { // parede topo
+            val t = (top - oy) / dy
+            if (t > 1e-3f) {
+                val x = ox + dx * t
+                if (x in left..right && t < bestT) { bestT = t; nx = 0f; ny = 1f }
+            }
+        } else if (dy > 0f) { // parede base
+            val t = (bottom - oy) / dy
+            if (t > 1e-3f) {
+                val x = ox + dx * t
+                if (x in left..right && t < bestT) { bestT = t; nx = 0f; ny = -1f }
+            }
+        }
+
+        return if (bestT != Float.MAX_VALUE) RailHit(bestT, nx, ny) else null
+    }
+
+    private fun reflect(dx: Float, dy: Float, nx: Float, ny: Float): Pair<Float, Float> {
+        val dot = dx * nx + dy * ny
+        return Pair(dx - 2f * dot * nx, dy - 2f * dot * ny)
+    }
+
+    // =====================================================================
+    // Tracker temporal das bolas
+    // =====================================================================
+
+    private fun updateBallTracker(detections: List<DetectedBall>): List<TrackedBall> {
+        val used = BooleanArray(detections.size)
+
+        for (tracked in trackedBalls) {
+            var bestIdx = -1
+            var bestDist = Float.MAX_VALUE
+            for (i in detections.indices) {
+                if (used[i]) continue
+                val d = dist(tracked.x, tracked.y, detections[i].x, detections[i].y)
+                if (d < bestDist && d < tracked.radius * 1.8f) {
+                    bestDist = d
+                    bestIdx = i
+                }
+            }
+            if (bestIdx >= 0) {
+                val det = detections[bestIdx]
+                used[bestIdx] = true
+                val a = DetectorConfig.positionSmoothing
+                tracked.x += a * (det.x - tracked.x)
+                tracked.y += a * (det.y - tracked.y)
+                tracked.radius += a * (det.radius - tracked.radius)
+                tracked.whiteness += a * (det.whiteness - tracked.whiteness)
+                tracked.hits = min(tracked.hits + 1, 30)
+                tracked.miss = 0
+            } else {
+                tracked.miss++
+            }
+        }
+
+        for (i in detections.indices) {
+            if (used[i]) continue
+            val det = detections[i]
+            trackedBalls.add(
+                TrackedBall(nextBallId++, det.x, det.y, det.radius, det.whiteness, hits = 1, miss = 0)
             )
         }
 
-        return indicators
+        trackedBalls.removeAll { it.miss > DetectorConfig.ballMaxMissFrames }
+
+        return trackedBalls.filter { it.hits >= DetectorConfig.ballPersistenceFrames && it.miss == 0 }
     }
 
-    private fun distance(x1: Float, y1: Float, x2: Float, y2: Float): Float {
-        return hypot((x1 - x2).toDouble(), (y1 - y2).toDouble()).toFloat()
+    // =====================================================================
+    // Construção de indicadores
+    // =====================================================================
+
+    private fun tableIndicator(table: TableRegion): VisualIndicator =
+        VisualIndicator(
+            shape = VisualIndicatorShape.RECT,
+            x = table.playLeft, y = table.playTop, endX = table.playRight, endY = table.playBottom,
+            color = tableColor, strokeWidth = 6f, label = "Mesa"
+        )
+
+    private fun ballIndicators(balls: List<TrackedBall>, main: TrackedBall?): List<VisualIndicator> {
+        val out = ArrayList<VisualIndicator>(balls.size)
+        for (ball in balls) {
+            val isMain = ball === main
+            out += VisualIndicator(
+                shape = VisualIndicatorShape.CIRCLE,
+                x = ball.x, y = ball.y, radius = ball.radius,
+                color = if (isMain) mainBallColor else ballColor,
+                strokeWidth = if (isMain) 7f else 5f,
+                fill = isMain,
+                crosshair = isMain,
+                label = if (isMain) "Principal" else null
+            )
+        }
+        return out
     }
 
-    private data class AnalysisMatrix(
+    private fun lineIndicator(
+        x: Float, y: Float, ex: Float, ey: Float, color: Int, width: Float,
+        arrow: Boolean = false, dashed: Boolean = false, label: String? = null
+    ): VisualIndicator = VisualIndicator(
+        shape = VisualIndicatorShape.LINE,
+        x = x, y = y, endX = ex, endY = ey, color = color,
+        strokeWidth = width, arrow = arrow, dashed = dashed, label = label
+    )
+
+    private fun debugIndicators(matrix: AnalysisMatrix, table: TableRegion, cue: CueLine?): List<VisualIndicator> {
+        val out = ArrayList<VisualIndicator>()
+        out += VisualIndicator(
+            shape = VisualIndicatorShape.RECT,
+            x = table.left, y = table.top, endX = table.right, endY = table.bottom,
+            color = debugColor, strokeWidth = 3f, dashed = true,
+            label = "pano ${table.profile}"
+        )
+        if (cue != null) {
+            out += lineIndicator(
+                cue.axisX - cue.aimX * 300f, cue.axisY - cue.aimY * 300f,
+                cue.axisX + cue.aimX * 300f, cue.axisY + cue.aimY * 300f,
+                debugColor, 3f, arrow = true, label = "taco ${(cue.confidence * 100).roundToInt()}%"
+            )
+        }
+        return out
+    }
+
+    // ---- utils -----------------------------------------------------------------
+
+    private fun withAlpha(color: Int, alpha: Int): Int =
+        Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
+
+    private fun dist(x1: Float, y1: Float, x2: Float, y2: Float): Float =
+        hypot((x1 - x2).toDouble(), (y1 - y2).toDouble()).toFloat()
+
+    private fun angleDelta(target: Float, current: Float): Float {
+        var d = target - current
+        while (d > Math.PI) d -= (2.0 * Math.PI).toFloat()
+        while (d < -Math.PI) d += (2.0 * Math.PI).toFloat()
+        return d
+    }
+
+    private fun List<Float>.sortedOrNull(): Float? =
+        if (isEmpty()) null else sorted()[size / 2]
+
+    // =====================================================================
+    // Modelos internos
+    // =====================================================================
+
+    private class AnalysisMatrix(
         val width: Int,
         val height: Int,
         val scaleX: Float,
         val scaleY: Float,
-        val luminance: IntArray,
-        val edge: FloatArray,
-        val edgeMask: BooleanArray
-    )
+        val hue: FloatArray,
+        val sat: FloatArray,
+        val value: FloatArray
+    ) {
+        val size: Int get() = width * height
+        var cloth: BooleanArray = BooleanArray(0)
+    }
 
-    private data class Component(
-        val points: IntArray,
+    private data class Blob(
+        val count: Long,
+        val centerX: Float,
+        val centerY: Float,
+        val covXX: Float,
+        val covYY: Float,
+        val covXY: Float,
+        val meanSat: Float,
+        val meanVal: Float,
         val minX: Int,
         val minY: Int,
         val maxX: Int,
-        val maxY: Int,
-        val sumX: Long,
-        val sumY: Long
-    ) {
-        val width: Int get() = maxX - minX + 1
-        val height: Int get() = maxY - minY + 1
-    }
+        val maxY: Int
+    )
 
-    private data class CircleCandidate(
+    private data class EigenAxis(
+        val dirX: Float,
+        val dirY: Float,
+        val lambda1: Float,
+        val lambda2: Float,
+        val elongation: Float
+    )
+
+    private class TableRegion(
+        val sampledMinX: Int,
+        val sampledMinY: Int,
+        val sampledMaxX: Int,
+        val sampledMaxY: Int,
+        val left: Float,
+        val top: Float,
+        val right: Float,
+        val bottom: Float,
+        val playLeft: Float,
+        val playTop: Float,
+        val playRight: Float,
+        val playBottom: Float,
+        val profile: DetectorConfig.ClothProfile
+    )
+
+    private data class DetectedBall(
         val x: Float,
         val y: Float,
         val radius: Float,
-        val score: Float
+        val whiteness: Float
     )
 
-    private data class CornerBoxCandidate(
-        val x: Float,
-        val y: Float,
-        val width: Float,
-        val height: Float,
-        val score: Float
+    private class TrackedBall(
+        val id: Int,
+        var x: Float,
+        var y: Float,
+        var radius: Float,
+        var whiteness: Float,
+        var hits: Int,
+        var miss: Int
     )
 
-    private data class CollisionCandidate(
-        val startX: Float,
-        val startY: Float,
-        val impactX: Float,
-        val impactY: Float,
-        val travelDistance: Float,
-        val clearance: Float,
-        val target: CircleCandidate
+    private class CueLine(
+        val axisX: Float,
+        val axisY: Float,
+        val aimX: Float,
+        val aimY: Float,
+        val confidence: Float,
+        val cueBall: TrackedBall?
+    )
+
+    private class RailHit(
+        val t: Float,
+        val normalX: Float,
+        val normalY: Float
+    )
+
+    private class PlayResolution(
+        val mainBall: TrackedBall,
+        val aimX: Float,
+        val aimY: Float
     )
 }
