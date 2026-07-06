@@ -127,7 +127,7 @@ class IndicatorOverlayService : Service() {
             getString(R.string.app_name),
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "Overlay de indicadores visuais para acessibilidade do ERP"
+            description = "Overlay com a análise da jogada sobre a mesa de sinuca"
             setSound(null, null)
         }
 
@@ -148,7 +148,7 @@ class IndicatorOverlayService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Indicadores visuais ativos sobre o ERP")
+            .setContentText("Análise da jogada ativa sobre a mesa")
             .setSmallIcon(R.drawable.ic_8_ball)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)

@@ -117,6 +117,11 @@ class ScreenCaptureService : Service() {
 
         val projectionManager = getSystemService(MediaProjectionManager::class.java)
         val projection = projectionManager.getMediaProjection(resultCode, resultData)
+        if (projection == null) {
+            Log.e(TAG, "Unable to obtain MediaProjection (consent token invalid?)")
+            stopSelf()
+            return
+        }
 
         val (screenWidth, screenHeight, densityDpi) = getScreenMetrics()
         imageReader = ImageReader.newInstance(
@@ -126,12 +131,12 @@ class ScreenCaptureService : Service() {
             IMAGE_BUFFER_SIZE
         )
 
-        mediaProjection = projection.apply {
-            registerCallback(projectionCallback, captureHandler)
-        }
+        // On Android 14+ the callback must be registered before creating the VirtualDisplay.
+        projection.registerCallback(projectionCallback, captureHandler)
+        mediaProjection = projection
 
         virtualDisplay = projection.createVirtualDisplay(
-            "ERPAccessibilityScreenCapture",
+            "PoolTableScreenCapture",
             screenWidth,
             screenHeight,
             densityDpi,
@@ -246,7 +251,7 @@ class ScreenCaptureService : Service() {
             getString(R.string.app_name),
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "Captura de tela para acessibilidade do ERP"
+            description = "Captura de tela para análise visual da mesa de sinuca"
             setSound(null, null)
         }
 
@@ -267,7 +272,7 @@ class ScreenCaptureService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Capturando tela para acessibilidade do ERP")
+            .setContentText("Analisando a mesa de sinuca em tempo real")
             .setSmallIcon(R.drawable.ic_8_ball)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)

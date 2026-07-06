@@ -45,7 +45,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="erp_accessibility_visual_indicators" />
+                android:value="pool_table_visual_analysis" />
         </service>
 
         <service
@@ -53,7 +53,11 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="specialUse"
-            android:visibleToInstantApps="false" />
+            android:visibleToInstantApps="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="pool_table_visual_analysis" />
+        </service>
     </application>
 
 </manifest>
