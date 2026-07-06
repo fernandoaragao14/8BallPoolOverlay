@@ -5,15 +5,15 @@ import android.os.Bundle
 import android.util.Log
 import androidx.appcompat.app.AppCompatActivity
 
-
 class HomeActivity : AppCompatActivity() {
 
     private val TAG = "HomeActivity"
+
     override fun onCreate(savedInstanceState: Bundle?) {
         Log.d(TAG, "onCreate")
         super.onCreate(savedInstanceState)
 
-        stopService()
+        stopServices()
         goToHome()
         finish()
     }
@@ -25,10 +25,19 @@ class HomeActivity : AppCompatActivity() {
         runCatching { startActivity(homeIntent) }
     }
 
-    private fun stopService() {
-        Log.d(TAG, "stopService")
-        val serviceIntent = Intent(this, OverlayService::class.java)
-        serviceIntent.setAction(OverlayService.ACTION_STOP_SERVICE)
-        stopService(serviceIntent)
+    private fun stopServices() {
+        Log.d(TAG, "stopServices")
+
+        stopService(Intent(this, OverlayService::class.java).apply {
+            action = OverlayService.ACTION_STOP_SERVICE
+        })
+
+        stopService(Intent(this, ScreenCaptureService::class.java).apply {
+            action = ScreenCaptureService.ACTION_STOP_CAPTURE
+        })
+
+        stopService(Intent(this, IndicatorOverlayService::class.java).apply {
+            action = IndicatorOverlayService.ACTION_STOP_SERVICE
+        })
     }
 }
