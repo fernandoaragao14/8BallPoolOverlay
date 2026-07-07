@@ -25,6 +25,7 @@ class IndicatorOverlayService : Service() {
         const val ACTION_STOP_SERVICE = "app.hack.eightballpool.action.STOP_INDICATOR_OVERLAY"
         const val ACTION_TOGGLE_AUTO = "app.hack.eightballpool.action.TOGGLE_AUTO"
         const val ACTION_TOGGLE_DEBUG = "app.hack.eightballpool.action.TOGGLE_DEBUG"
+        const val ACTION_CYCLE_ROTATION = "app.hack.eightballpool.action.CYCLE_ROTATION"
 
         private const val TAG = "IndicatorOverlayService"
         private const val CHANNEL_ID = "IndicatorOverlayServiceChannel"
@@ -73,6 +74,10 @@ class IndicatorOverlayService : Service() {
             }
             ACTION_TOGGLE_DEBUG -> {
                 DetectorConfig.debugOverlay = !DetectorConfig.debugOverlay
+                updateNotification()
+            }
+            ACTION_CYCLE_ROTATION -> {
+                DetectorConfig.captureRotationDeg = (DetectorConfig.captureRotationDeg + 90) % 360
                 updateNotification()
             }
             else -> addOverlay()
@@ -167,6 +172,7 @@ class IndicatorOverlayService : Service() {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .addAction(0, autoLabel, serviceAction(ACTION_TOGGLE_AUTO, 1))
             .addAction(0, debugLabel, serviceAction(ACTION_TOGGLE_DEBUG, 2))
+            .addAction(0, "Girar ${DetectorConfig.captureRotationDeg}°", serviceAction(ACTION_CYCLE_ROTATION, 4))
             .addAction(0, getString(R.string.stop), serviceAction(ACTION_STOP_SERVICE, 3))
             .build()
     }

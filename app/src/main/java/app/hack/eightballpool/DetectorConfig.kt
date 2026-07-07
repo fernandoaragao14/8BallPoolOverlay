@@ -25,6 +25,14 @@ object DetectorConfig {
      */
     var maxAnalysisSide: Int = 480
 
+    /**
+     * Rotação aplicada ao frame capturado antes da análise (0/90/180/270).
+     * O buffer do MediaProjection às vezes chega em retrato enquanto o jogo roda em
+     * paisagem; gire até as linhas baterem na mesa. As coordenadas de saída já saem
+     * no espaço orientado (mesma da overlay em paisagem). Cicle pela notificação.
+     */
+    var captureRotationDeg: Int = 90
+
     // ---- Segmentação da mesa ---------------------------------------------------
     /** Padrão BLUE: o pano do jogo 8 Ball Pool é azul/ciano. Use AUTO/GREEN para mesa real. */
     var clothProfile: ClothProfile = ClothProfile.BLUE

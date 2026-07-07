@@ -65,6 +65,7 @@ object ScreenFrameProcessor {
     private val trackedBalls = ArrayList<TrackedBall>()
     private var nextBallId = 1
     private var frameCounter = 0L
+    private var pixelBuffer = IntArray(0)
     private var smoothedAimAngle: Float? = null
     private var smoothedAimConfidence: Float = 0f
     private var smoothedAimOriginX: Float = 0f
@@ -186,7 +187,7 @@ object ScreenFrameProcessor {
         val res = "${(matrix.width * matrix.scaleX).toInt()}x${(matrix.height * matrix.scaleY).toInt()}"
         val text = buildString {
             append("DEBUG 8BP  frame ${frameCounter % 100000}\n")
-            append("captura: OK ($res)\n")
+            append("captura: OK ($res)  giro: ${DetectorConfig.captureRotationDeg}°\n")
             append("perfil: ${DetectorConfig.clothProfile}  pano: ${(clothPct * 100).toInt()}%\n")
             append("mesa: ${if (tableFound) "SIM" else "NAO (ajustar HSV azul)"}\n")
             append("bolas: $balls   branca: ${if (cue) "SIM" else "NAO"}\n")
@@ -224,31 +225,45 @@ object ScreenFrameProcessor {
     // =====================================================================
 
     private fun buildAnalysisMatrix(bitmap: Bitmap): AnalysisMatrix {
-        val step = max(
-            1,
-            ceil(max(bitmap.width, bitmap.height).toDouble() / DetectorConfig.maxAnalysisSide).toInt()
-        )
-        val w = max(1, bitmap.width / step)
-        val h = max(1, bitmap.height / step)
-        val scaleX = bitmap.width.toFloat() / w
-        val scaleY = bitmap.height.toFloat() / h
+        val bw = bitmap.width
+        val bh = bitmap.height
+
+        // Carrega o frame inteiro num buffer reaproveitado (sem alocar por frame).
+        val needed = bw * bh
+        if (pixelBuffer.size < needed) pixelBuffer = IntArray(needed)
+        bitmap.getPixels(pixelBuffer, 0, bw, 0, 0, bw, bh)
+
+        // Dimensões orientadas: 90/270 trocam largura por altura (paisagem).
+        val rot = ((DetectorConfig.captureRotationDeg % 360) + 360) % 360
+        val ow = if (rot == 90 || rot == 270) bh else bw
+        val oh = if (rot == 90 || rot == 270) bw else bh
+
+        val step = max(1, ceil(max(ow, oh).toDouble() / DetectorConfig.maxAnalysisSide).toInt())
+        val w = max(1, ow / step)
+        val h = max(1, oh / step)
+        val scaleX = ow.toFloat() / w
+        val scaleY = oh.toFloat() / h
 
         val hue = FloatArray(w * h)
         val sat = FloatArray(w * h)
         val value = FloatArray(w * h)
-        val row = IntArray(bitmap.width)
 
         for (y in 0 until h) {
-            val sy = min(bitmap.height - 1, y * step)
-            bitmap.getPixels(row, 0, bitmap.width, 0, sy, bitmap.width, 1)
+            val oy = min(oh - 1, y * step)
             val base = y * w
             for (x in 0 until w) {
-                val sx = min(bitmap.width - 1, x * step)
-                val p = row[sx]
-                val r = Color.red(p)
-                val g = Color.green(p)
-                val b = Color.blue(p)
-                rgbToHsv(r, g, b, base + x, hue, sat, value)
+                val ox = min(ow - 1, x * step)
+                // Mapeia coordenada orientada (ox,oy) de volta para o pixel do buffer.
+                val sx: Int
+                val sy: Int
+                when (rot) {
+                    90 -> { sx = oy; sy = bh - 1 - ox }
+                    180 -> { sx = bw - 1 - ox; sy = bh - 1 - oy }
+                    270 -> { sx = bw - 1 - oy; sy = ox }
+                    else -> { sx = ox; sy = oy }
+                }
+                val p = pixelBuffer[sy * bw + sx]
+                rgbToHsv(Color.red(p), Color.green(p), Color.blue(p), base + x, hue, sat, value)
             }
         }
 
