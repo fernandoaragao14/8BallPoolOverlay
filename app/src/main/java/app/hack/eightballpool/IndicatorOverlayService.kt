@@ -23,6 +23,8 @@ class IndicatorOverlayService : Service() {
     companion object {
         const val ACTION_START_SERVICE = "app.hack.eightballpool.action.START_INDICATOR_OVERLAY"
         const val ACTION_STOP_SERVICE = "app.hack.eightballpool.action.STOP_INDICATOR_OVERLAY"
+        const val ACTION_TOGGLE_AUTO = "app.hack.eightballpool.action.TOGGLE_AUTO"
+        const val ACTION_TOGGLE_DEBUG = "app.hack.eightballpool.action.TOGGLE_DEBUG"
 
         private const val TAG = "IndicatorOverlayService"
         private const val CHANNEL_ID = "IndicatorOverlayServiceChannel"
@@ -65,6 +67,14 @@ class IndicatorOverlayService : Service() {
 
         when (intent?.action) {
             ACTION_STOP_SERVICE -> stopSelf()
+            ACTION_TOGGLE_AUTO -> {
+                DetectorConfig.opportunityMode = !DetectorConfig.opportunityMode
+                updateNotification()
+            }
+            ACTION_TOGGLE_DEBUG -> {
+                DetectorConfig.debugOverlay = !DetectorConfig.debugOverlay
+                updateNotification()
+            }
             else -> addOverlay()
         }
 
@@ -134,17 +144,19 @@ class IndicatorOverlayService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun createNotification(): Notification {
-        val stopIntent = Intent(this, IndicatorOverlayService::class.java).apply {
-            action = ACTION_STOP_SERVICE
-        }
+    private fun updateNotification() {
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, createNotification())
+    }
 
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            0,
-            stopIntent,
-            PendingIntent.FLAG_IMMUTABLE
-        )
+    private fun serviceAction(action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(this, IndicatorOverlayService::class.java).apply { this.action = action }
+        return PendingIntent.getService(this, requestCode, intent, PendingIntent.FLAG_IMMUTABLE)
+    }
+
+    private fun createNotification(): Notification {
+        val autoLabel = if (DetectorConfig.opportunityMode) "Auto: ON" else "Auto: OFF"
+        val debugLabel = if (DetectorConfig.debugOverlay) "Debug: ON" else "Debug: OFF"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
@@ -152,7 +164,9 @@ class IndicatorOverlayService : Service() {
             .setSmallIcon(R.drawable.ic_8_ball)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(0, getString(R.string.stop), stopPendingIntent)
+            .addAction(0, autoLabel, serviceAction(ACTION_TOGGLE_AUTO, 1))
+            .addAction(0, debugLabel, serviceAction(ACTION_TOGGLE_DEBUG, 2))
+            .addAction(0, getString(R.string.stop), serviceAction(ACTION_STOP_SERVICE, 3))
             .build()
     }
 }

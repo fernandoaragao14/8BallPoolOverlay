@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.os.SystemClock
 import android.util.Log
 import kotlin.math.abs
+import kotlin.math.acos
 import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.cos
@@ -46,6 +47,12 @@ object ScreenFrameProcessor {
     // Ciano (não-branco) para não realimentar o detector da linha de mira branca.
     private val cueDeflectColor = Color.argb(160, 120, 235, 235)
     private val debugColor = Color.argb(200, 255, 0, 255)
+
+    // Modo oportunidades.
+    private val pocketColor = Color.argb(230, 255, 235, 120)
+    private val bestShotColor = Color.argb(245, 60, 255, 120)
+    private val bestTargetColor = Color.argb(245, 255, 205, 40)
+    private val altShotColor = Color.argb(150, 120, 230, 255)
 
     @Volatile
     private var latestBitmap: Bitmap? = null
@@ -134,13 +141,22 @@ object ScreenFrameProcessor {
         val emittedBalls = updateBallTracker(rawBalls)
 
         val cue = detectCue(blobs, matrix, table, emittedBalls)
+        val cueBall = emittedBalls.maxByOrNull { it.whiteness }
+            ?.takeIf { it.whiteness >= DetectorConfig.cueBallMinValue * (1f - DetectorConfig.cueBallMaxSat) }
 
-        // Escolha da bola principal + direção de mira.
+        // Escolha da bola principal + direção de mira (jogada que você está mirando).
         val play = resolveAim(emittedBalls, cue, matrix)
 
         val indicators = ArrayList<VisualIndicator>()
         indicators += tableIndicator(table)
-        indicators += ballIndicators(emittedBalls, play?.mainBall)
+
+        // Modo automático: destaca sozinho as melhores jogadas (bola -> caçapa).
+        if (DetectorConfig.opportunityMode && cueBall != null) {
+            indicators += pocketIndicators(table)
+            indicators += opportunityIndicators(computeOpportunities(emittedBalls, cueBall, table))
+        }
+
+        indicators += ballIndicators(emittedBalls, play?.mainBall ?: cueBall)
 
         if (play != null && smoothedAimConfidence >= DetectorConfig.minAimConfidence) {
             indicators += trajectoryIndicators(play, emittedBalls, table)
@@ -914,6 +930,146 @@ object ScreenFrameProcessor {
     }
 
     // =====================================================================
+    // Modo automático de jogadas (oportunidades)
+    // =====================================================================
+
+    /** 6 caçapas a partir do retângulo do pano (4 cantos + 2 meio das tabelas longas). */
+    private fun tablePockets(table: TableRegion): Array<FloatArray> {
+        val cx = (table.left + table.right) / 2f
+        return arrayOf(
+            floatArrayOf(table.left, table.top),
+            floatArrayOf(table.right, table.top),
+            floatArrayOf(table.left, table.bottom),
+            floatArrayOf(table.right, table.bottom),
+            floatArrayOf(cx, table.top),
+            floatArrayOf(cx, table.bottom)
+        )
+    }
+
+    private fun computeOpportunities(
+        balls: List<TrackedBall>,
+        cueBall: TrackedBall,
+        table: TableRegion
+    ): List<Shot> {
+        val pockets = tablePockets(table)
+        val targets = balls.filter { it !== cueBall }
+        if (targets.isEmpty()) return emptyList()
+
+        val cueR = cueBall.radius
+        val tableWidth = table.right - table.left
+        val minCutCos = cos(Math.toRadians(DetectorConfig.maxCutAngleDeg.toDouble())).toFloat()
+
+        val shots = ArrayList<Shot>()
+        for (ball in targets) {
+            var bestForBall: Shot? = null
+            for (pocket in pockets) {
+                var bpx = pocket[0] - ball.x
+                var bpy = pocket[1] - ball.y
+                val bpn = hypot(bpx.toDouble(), bpy.toDouble()).toFloat()
+                if (bpn < 1f) continue
+                bpx /= bpn; bpy /= bpn
+
+                // Ponto fantasma: centro da branca no contato para mandar a bola à caçapa.
+                val ghostX = ball.x - bpx * (cueR + ball.radius)
+                val ghostY = ball.y - bpy * (cueR + ball.radius)
+                if (ghostX < table.playLeft + cueR || ghostX > table.playRight - cueR) continue
+                if (ghostY < table.playTop + cueR || ghostY > table.playBottom - cueR) continue
+
+                var cgx = ghostX - cueBall.x
+                var cgy = ghostY - cueBall.y
+                val cgn = hypot(cgx.toDouble(), cgy.toDouble()).toFloat()
+                if (cgn < 1f) continue
+                cgx /= cgn; cgy /= cgn
+
+                val cutCos = cgx * bpx + cgy * bpy
+                if (cutCos < minCutCos) continue
+
+                // Caminhos livres: branca -> fantasma e bola -> caçapa.
+                if (segmentBlocked(cueBall.x, cueBall.y, ghostX, ghostY, cueR, balls, cueBall, ball)) continue
+                if (segmentBlocked(ball.x, ball.y, pocket[0], pocket[1], ball.radius, balls, ball, null)) continue
+
+                val distScore = 1f - (cgn + bpn) / (2f * tableWidth).coerceAtLeast(1f)
+                val score = cutCos * 0.7f + distScore.coerceIn(0f, 1f) * 0.3f
+
+                if (bestForBall == null || score > bestForBall.score) {
+                    bestForBall = Shot(ball, pocket[0], pocket[1], ghostX, ghostY, cueBall.x, cueBall.y, cutCos, score)
+                }
+            }
+            if (bestForBall != null) shots.add(bestForBall)
+        }
+
+        return shots.sortedByDescending { it.score }.take(DetectorConfig.maxOpportunities)
+    }
+
+    /** True se algum obstáculo cruza o segmento a->b (raio do móvel + raio do obstáculo + folga). */
+    private fun segmentBlocked(
+        ax: Float, ay: Float, bx: Float, by: Float, radius: Float,
+        balls: List<TrackedBall>, exclude1: TrackedBall?, exclude2: TrackedBall?
+    ): Boolean {
+        val dx = bx - ax
+        val dy = by - ay
+        val len2 = dx * dx + dy * dy
+        if (len2 < 1f) return false
+        for (c in balls) {
+            if (c === exclude1 || c === exclude2) continue
+            var t = ((c.x - ax) * dx + (c.y - ay) * dy) / len2
+            t = t.coerceIn(0f, 1f)
+            val px = ax + dx * t
+            val py = ay + dy * t
+            val dd = dist(c.x, c.y, px, py)
+            if (dd < radius + c.radius * (1f + DetectorConfig.pathClearanceBallFactor)) return true
+        }
+        return false
+    }
+
+    private fun pocketIndicators(table: TableRegion): List<VisualIndicator> {
+        val r = (table.right - table.left) * DetectorConfig.pocketRadiusFraction
+        return tablePockets(table).map { p ->
+            VisualIndicator(
+                shape = VisualIndicatorShape.CIRCLE,
+                x = p[0], y = p[1], radius = r, color = pocketColor, strokeWidth = 4f
+            )
+        }
+    }
+
+    private fun opportunityIndicators(shots: List<Shot>): List<VisualIndicator> {
+        val out = ArrayList<VisualIndicator>()
+        shots.forEachIndexed { index, shot ->
+            val best = index == 0
+            val shotColor = if (best) bestShotColor else altShotColor
+            val targetColor = if (best) bestTargetColor else altShotColor
+            val width = if (best) 8f else 5f
+
+            // Branca -> ponto fantasma (como mirar).
+            out += lineIndicator(shot.cueX, shot.cueY, shot.ghostX, shot.ghostY, shotColor, width, arrow = true)
+            // Fantasma (posição da branca no contato).
+            out += VisualIndicator(
+                shape = VisualIndicatorShape.MARKER,
+                x = shot.ghostX, y = shot.ghostY, radius = if (best) 11f else 8f, color = shotColor
+            )
+            // Bola -> caçapa.
+            val label = if (best) "Melhor jogada • ${difficultyLabel(shot.cutCos)}" else null
+            out += lineIndicator(shot.ball.x, shot.ball.y, shot.pocketX, shot.pocketY, targetColor, width, arrow = true, dashed = true, label = label)
+            // Destaque da caçapa alvo.
+            out += VisualIndicator(
+                shape = VisualIndicatorShape.CIRCLE,
+                x = shot.pocketX, y = shot.pocketY, radius = if (best) 26f else 18f,
+                color = targetColor, strokeWidth = if (best) 6f else 3f
+            )
+        }
+        return out
+    }
+
+    private fun difficultyLabel(cutCos: Float): String {
+        val deg = Math.toDegrees(acos(cutCos.coerceIn(-1f, 1f).toDouble()))
+        return when {
+            deg < 20 -> "Fácil"
+            deg < 45 -> "Média"
+            else -> "Difícil"
+        }
+    }
+
+    // =====================================================================
     // Tracker temporal das bolas
     // =====================================================================
 
@@ -1118,6 +1274,18 @@ object ScreenFrameProcessor {
         val dirX: Float,
         val dirY: Float,
         val confidence: Float
+    )
+
+    private class Shot(
+        val ball: TrackedBall,
+        val pocketX: Float,
+        val pocketY: Float,
+        val ghostX: Float,
+        val ghostY: Float,
+        val cueX: Float,
+        val cueY: Float,
+        val cutCos: Float,
+        val score: Float
     )
 
     private class RailHit(

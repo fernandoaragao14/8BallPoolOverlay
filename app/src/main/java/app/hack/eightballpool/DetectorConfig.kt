@@ -94,6 +94,22 @@ object DetectorConfig {
     /** Distância perpendicular máxima do eixo do taco até a bola principal, em raios de bola. */
     var cueMaxOffsetBallFactor: Float = 1.6f
 
+    // ---- Modo automático de jogadas (oportunidades) ----------------------------
+    /** Varre a mesa e destaca sozinho as melhores jogadas (bola -> caçapa). */
+    var opportunityMode: Boolean = true
+
+    /** Quantas jogadas destacar (a melhor fica em destaque, as demais mais fracas). */
+    var maxOpportunities: Int = 3
+
+    /** Ângulo de corte máximo aceito (graus). Acima disso a tacada é fina demais. */
+    var maxCutAngleDeg: Float = 72f
+
+    /** Raio da "boca" da caçapa como fração da largura da mesa (folga do caminho até o buraco). */
+    var pocketRadiusFraction: Float = 0.035f
+
+    /** Folga extra (em raios de bola) exigida para considerar um caminho "livre" de obstáculos. */
+    var pathClearanceBallFactor: Float = 0.4f
+
     // ---- Trajetória ------------------------------------------------------------
     /** Quantas rebatidas na tabela desenhar depois do primeiro impacto na borda. */
     var maxRailReflections: Int = 1
