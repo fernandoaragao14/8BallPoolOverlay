@@ -143,6 +143,12 @@ object DetectorConfig {
     /** Peso da nova medição na EMA do ângulo de mira. Alto para acompanhar a mirada ao vivo. */
     var aimSmoothing: Float = 0.65f
 
+    /**
+     * Se a mira girar mais que este ângulo (graus) entre frames, "cola" na nova
+     * direção na hora (rastreamento reativo: acompanha rotação rápida do taco sem lag).
+     */
+    var aimSnapDeg: Float = 10f
+
     /** Frames consecutivos que uma bola precisa aparecer para ser desenhada (1 = imediato). */
     var ballPersistenceFrames: Int = 1
 

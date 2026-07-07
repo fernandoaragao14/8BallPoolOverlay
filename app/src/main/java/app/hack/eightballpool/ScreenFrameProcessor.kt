@@ -191,6 +191,8 @@ object ScreenFrameProcessor {
             append("mesa: ${if (tableFound) "SIM" else "NAO (ajustar HSV azul)"}\n")
             append("bolas: $balls   branca: ${if (cue) "SIM" else "NAO"}\n")
             append("mira: ${if (aim) "SIM (${(smoothedAimConfidence * 100).toInt()}%)" else "NAO"}\n")
+            // Turno inferido pela presença da linha-guia (só aparece na sua vez).
+            append("turno: ${if (aim) "SUA VEZ" else "aguardando (sem guia)"}\n")
             val cut = if (statCutDeg >= 0f) "${statCutDeg.roundToInt()}°" else "-"
             append("fisica: alvo=${statMode} corte=$cut ric(alvo=$statTargetBounces branca=$statCueBounces)\n")
             append("auto: ${if (DetectorConfig.opportunityMode) "ON" else "OFF"}")
@@ -757,7 +759,10 @@ object ScreenFrameProcessor {
         smoothedAimAngle = if (current == null) {
             angle
         } else {
-            current + DetectorConfig.aimSmoothing * angleDelta(angle, current)
+            val d = angleDelta(angle, current)
+            val snap = Math.toRadians(DetectorConfig.aimSnapDeg.toDouble()).toFloat()
+            // Rotação grande do taco: acompanha na hora (reativo). Pequena: suaviza (estável).
+            if (abs(d) > snap) angle else current + DetectorConfig.aimSmoothing * d
         }
         smoothedAimConfidence = smoothedAimConfidence + 0.5f * (confidence - smoothedAimConfidence)
         if (smoothedAimConfidence < confidence) smoothedAimConfidence = confidence
