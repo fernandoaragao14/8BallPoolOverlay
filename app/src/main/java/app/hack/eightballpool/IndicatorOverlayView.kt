@@ -65,9 +65,15 @@ class IndicatorOverlayView(context: Context) : View(context) {
                 VisualIndicatorShape.CIRCLE -> drawCircle(canvas, it)
                 VisualIndicatorShape.MARKER -> drawMarker(canvas, it)
                 VisualIndicatorShape.LINE -> Unit
+                VisualIndicatorShape.TEXT -> Unit
             }
         }
-        indicators.forEach { it.label?.let { _ -> drawLabel(canvas, it) } }
+        indicators.forEach {
+            when (it.shape) {
+                VisualIndicatorShape.TEXT -> drawTextPanel(canvas, it)
+                else -> it.label?.let { _ -> drawLabel(canvas, it) }
+            }
+        }
     }
 
     private fun drawLine(canvas: Canvas, indicator: VisualIndicator) {
@@ -138,6 +144,32 @@ class IndicatorOverlayView(context: Context) : View(context) {
         strokePaint.color = Color.WHITE
         strokePaint.strokeWidth = 3f
         canvas.drawCircle(indicator.x, indicator.y, radius, strokePaint)
+    }
+
+    private fun drawTextPanel(canvas: Canvas, indicator: VisualIndicator) {
+        val text = indicator.label ?: return
+        val lines = text.split("\n")
+        val pad = 16f
+        val lineH = textPaint.textSize + 8f
+        var maxW = 0f
+        for (line in lines) maxW = max(maxW, textPaint.measureText(line))
+
+        val left = indicator.x
+        val top = indicator.y
+        labelBgPaint.color = Color.argb(205, 0, 0, 0)
+        canvas.drawRoundRect(
+            left, top,
+            left + maxW + pad * 2,
+            top + lineH * lines.size + pad,
+            16f, 16f, labelBgPaint
+        )
+        textPaint.color = indicator.color
+        var y = top + pad + textPaint.textSize
+        for (line in lines) {
+            canvas.drawText(line, left + pad, y, textPaint)
+            y += lineH
+        }
+        textPaint.color = Color.WHITE
     }
 
     private fun drawLabel(canvas: Canvas, indicator: VisualIndicator) {

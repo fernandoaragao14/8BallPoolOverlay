@@ -64,6 +64,7 @@ object ScreenFrameProcessor {
     // ---- Estado do tracker temporal (acessado só na thread de captura) --------
     private val trackedBalls = ArrayList<TrackedBall>()
     private var nextBallId = 1
+    private var frameCounter = 0L
     private var smoothedAimAngle: Float? = null
     private var smoothedAimConfidence: Float = 0f
     private var smoothedAimOriginX: Float = 0f
@@ -109,64 +110,102 @@ object ScreenFrameProcessor {
     // =====================================================================
 
     private fun detectAndPublish(bitmap: Bitmap) {
+        frameCounter++
         val matrix = buildAnalysisMatrix(bitmap)
         val table = segmentTable(matrix)
-
-        if (table == null) {
-            // Sem mesa confiável: não polui a tela, apenas limpa (mantém último por decaimento do tracker).
-            decayTracking()
-            if (DetectorConfig.debugOverlay) {
-                // Confirma que captura+overlay funcionam, mas o pano não foi detectado.
-                val fw = matrix.width * matrix.scaleX
-                val fh = matrix.height * matrix.scaleY
-                OverlayIndicatorBus.setIndicators(
-                    listOf(
-                        VisualIndicator(
-                            shape = VisualIndicatorShape.MARKER,
-                            x = fw * 0.5f, y = fh * 0.12f, radius = 14f, color = debugColor,
-                            label = "SEM MESA (perfil ${DetectorConfig.clothProfile}) - ajustar HSV"
-                        )
-                    )
-                )
-            } else {
-                OverlayIndicatorBus.setIndicators(emptyList())
-            }
-            return
-        }
-
-        val notCloth = BooleanArray(matrix.size) { !matrix.cloth[it] }
-        val blobs = labelBlobs(notCloth, matrix)
-
-        val rawBalls = extractBalls(blobs, matrix, table)
-        val emittedBalls = updateBallTracker(rawBalls)
-
-        val cue = detectCue(blobs, matrix, table, emittedBalls)
-        val cueBall = emittedBalls.maxByOrNull { it.whiteness }
-            ?.takeIf { it.whiteness >= DetectorConfig.cueBallMinValue * (1f - DetectorConfig.cueBallMaxSat) }
-
-        // Escolha da bola principal + direção de mira (jogada que você está mirando).
-        val play = resolveAim(emittedBalls, cue, matrix)
+        val clothPct = clothFraction(matrix, segmentPrepared = true)
 
         val indicators = ArrayList<VisualIndicator>()
-        indicators += tableIndicator(table)
+        var ballsCount = 0
+        var cueFound = false
+        var aimFound = false
 
-        // Modo automático: destaca sozinho as melhores jogadas (bola -> caçapa).
-        if (DetectorConfig.opportunityMode && cueBall != null) {
-            indicators += pocketIndicators(table)
-            indicators += opportunityIndicators(computeOpportunities(emittedBalls, cueBall, table))
+        if (table != null) {
+            val notCloth = BooleanArray(matrix.size) { !matrix.cloth[it] }
+            val blobs = labelBlobs(notCloth, matrix)
+
+            val rawBalls = extractBalls(blobs, matrix, table)
+            val emittedBalls = updateBallTracker(rawBalls)
+
+            val cue = detectCue(blobs, matrix, table, emittedBalls)
+            val cueBall = emittedBalls.maxByOrNull { it.whiteness }
+                ?.takeIf { it.whiteness >= DetectorConfig.cueBallMinValue * (1f - DetectorConfig.cueBallMaxSat) }
+
+            // Bola principal + direção de mira (jogada que você está mirando).
+            val play = resolveAim(emittedBalls, cue, matrix)
+
+            indicators += tableIndicator(table)
+
+            // Modo automático: destaca sozinho as melhores jogadas (bola -> caçapa).
+            if (DetectorConfig.opportunityMode && cueBall != null) {
+                indicators += pocketIndicators(table)
+                indicators += opportunityIndicators(computeOpportunities(emittedBalls, cueBall, table))
+            }
+
+            indicators += ballIndicators(emittedBalls, play?.mainBall ?: cueBall)
+
+            if (play != null && smoothedAimConfidence >= DetectorConfig.minAimConfidence) {
+                indicators += trajectoryIndicators(play, emittedBalls, table)
+                aimFound = true
+            }
+
+            if (DetectorConfig.debugOverlay) {
+                indicators += debugIndicators(matrix, table, cue)
+            }
+
+            ballsCount = emittedBalls.size
+            cueFound = cueBall != null
+        } else {
+            decayTracking()
         }
 
-        indicators += ballIndicators(emittedBalls, play?.mainBall ?: cueBall)
-
-        if (play != null && smoothedAimConfidence >= DetectorConfig.minAimConfidence) {
-            indicators += trajectoryIndicators(play, emittedBalls, table)
-        }
-
+        // HUD de diagnóstico: sempre no topo quando o debug está ligado. Se este
+        // painel aparece, então captura + overlay estão funcionando.
         if (DetectorConfig.debugOverlay) {
-            indicators += debugIndicators(matrix, table, cue)
+            indicators.add(0, hudIndicator(matrix, table != null, clothPct, ballsCount, cueFound, aimFound))
         }
 
         OverlayIndicatorBus.setIndicators(indicators)
+    }
+
+    private fun hudIndicator(
+        matrix: AnalysisMatrix,
+        tableFound: Boolean,
+        clothPct: Float,
+        balls: Int,
+        cue: Boolean,
+        aim: Boolean
+    ): VisualIndicator {
+        val res = "${(matrix.width * matrix.scaleX).toInt()}x${(matrix.height * matrix.scaleY).toInt()}"
+        val text = buildString {
+            append("DEBUG 8BP  frame ${frameCounter % 100000}\n")
+            append("captura: OK ($res)\n")
+            append("perfil: ${DetectorConfig.clothProfile}  pano: ${(clothPct * 100).toInt()}%\n")
+            append("mesa: ${if (tableFound) "SIM" else "NAO (ajustar HSV azul)"}\n")
+            append("bolas: $balls   branca: ${if (cue) "SIM" else "NAO"}\n")
+            append("mira: ${if (aim) "SIM (${(smoothedAimConfidence * 100).toInt()}%)" else "NAO"}\n")
+            append("auto: ${if (DetectorConfig.opportunityMode) "ON" else "OFF"}")
+        }
+        return VisualIndicator(
+            shape = VisualIndicatorShape.TEXT,
+            x = 24f, y = 40f, color = Color.argb(255, 90, 255, 140), label = text
+        )
+    }
+
+    /** Fração de pixels que casam com o perfil de pano (para o HUD/calibração). */
+    private fun clothFraction(matrix: AnalysisMatrix, segmentPrepared: Boolean): Float {
+        if (segmentPrepared && matrix.cloth.isNotEmpty()) {
+            var c = 0
+            for (v in matrix.cloth) if (v) c++
+            return c.toFloat() / matrix.size
+        }
+        val profile = if (DetectorConfig.clothProfile == DetectorConfig.ClothProfile.AUTO)
+            chooseProfile(matrix) else DetectorConfig.clothProfile
+        var c = 0
+        for (i in 0 until matrix.size) {
+            if (matchesProfile(profile, matrix.hue[i], matrix.sat[i], matrix.value[i])) c++
+        }
+        return c.toFloat() / matrix.size
     }
 
     // =====================================================================

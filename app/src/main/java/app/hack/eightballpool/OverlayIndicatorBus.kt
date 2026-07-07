@@ -19,7 +19,10 @@ enum class VisualIndicatorShape {
     LINE,
 
     /** Ponto pequeno preenchido com rótulo (impacto, ghost ball). */
-    MARKER
+    MARKER,
+
+    /** Painel de texto (HUD de diagnóstico) desenhado direto em [x],[y], multilinha com `\n`. */
+    TEXT
 }
 
 /**
