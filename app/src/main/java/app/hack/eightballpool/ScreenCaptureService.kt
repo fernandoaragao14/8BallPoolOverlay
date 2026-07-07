@@ -36,7 +36,7 @@ class ScreenCaptureService : Service() {
         private const val TAG = "ScreenCaptureService"
         private const val CHANNEL_ID = "ScreenCaptureServiceChannel"
         private const val NOTIFICATION_ID = 889
-        private const val FRAME_INTERVAL_MS = 100L
+        private const val FRAME_INTERVAL_MS = 66L
         private const val IMAGE_BUFFER_SIZE = 3
     }
 

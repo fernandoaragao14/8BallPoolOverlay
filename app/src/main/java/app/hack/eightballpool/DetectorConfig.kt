@@ -20,9 +20,10 @@ object DetectorConfig {
     // ---- Resolução de análise --------------------------------------------------
     /**
      * Maior lado da matriz de análise (px). Maior = mais preciso e mais lento.
-     * 640 ajuda a preservar a linha de mira fina que o jogo 8 Ball Pool desenha.
+     * 480 mantém boa latência (tempo real na mirada); o scan da linha checa
+     * vizinhança 3x3, então a linha fina do jogo ainda é detectada.
      */
-    var maxAnalysisSide: Int = 640
+    var maxAnalysisSide: Int = 480
 
     // ---- Segmentação da mesa ---------------------------------------------------
     /** Padrão BLUE: o pano do jogo 8 Ball Pool é azul/ciano. Use AUTO/GREEN para mesa real. */
@@ -71,15 +72,20 @@ object DetectorConfig {
     var readGameAimLine: Boolean = true
 
     /** Pixel "branco" da linha: valor alto e saturação baixa. */
-    var aimLineMinValue: Float = 0.78f
-    var aimLineMaxSat: Float = 0.22f
+    var aimLineMinValue: Float = 0.74f
+    var aimLineMaxSat: Float = 0.26f
 
-    /** Anel (em raios de bola) ao redor da branca onde a direção da linha é medida (antes de ramificar). */
-    var aimLineAnnulusMin: Float = 1.25f
-    var aimLineAnnulusMax: Float = 6.0f
+    /**
+     * Scan radial: dispara raios da bola branca em todas as direções e acha a
+     * linha branca mais longa do jogo. Mais robusto e em tempo real.
+     */
+    var guidelineAngleStepDeg: Float = 1.5f
 
-    /** Pixels brancos mínimos (na matriz) para aceitar a linha de mira. */
-    var aimLineMinPixels: Int = 6
+    /** Buracos (pixels não-brancos) tolerados ao longo da linha antes de cortar. */
+    var guidelineMaxGap: Int = 3
+
+    /** Comprimento mínimo da linha (em raios de bola) para aceitar a mira. */
+    var guidelineMinRunBallFactor: Float = 2.2f
 
     // ---- Detecção do taco ------------------------------------------------------
     /** Raio de busca do taco ao redor da bola principal, em múltiplos do raio da bola. */
@@ -95,8 +101,12 @@ object DetectorConfig {
     var cueMaxOffsetBallFactor: Float = 1.6f
 
     // ---- Modo automático de jogadas (oportunidades) ----------------------------
-    /** Varre a mesa e destaca sozinho as melhores jogadas (bola -> caçapa). */
-    var opportunityMode: Boolean = true
+    /**
+     * Varre a mesa e destaca sozinho as melhores jogadas (bola -> caçapa).
+     * Desligado por padrão: é derivado da detecção (mais ruidoso). A mira ao vivo
+     * estendida da linha do jogo é mais confiável. Ligue pela notificação se quiser.
+     */
+    var opportunityMode: Boolean = false
 
     /** Quantas jogadas destacar (a melhor fica em destaque, as demais mais fracas). */
     var maxOpportunities: Int = 3
@@ -118,14 +128,14 @@ object DetectorConfig {
     var drawCueDeflection: Boolean = true
 
     // ---- Suavização temporal ---------------------------------------------------
-    /** Peso da nova medição na EMA de posição (0..1). Menor = mais estável, mais lento. */
-    var positionSmoothing: Float = 0.5f
+    /** Peso da nova medição na EMA de posição (0..1). Maior = segue mais rápido a mira. */
+    var positionSmoothing: Float = 0.6f
 
-    /** Peso da nova medição na EMA do ângulo de mira. */
-    var aimSmoothing: Float = 0.4f
+    /** Peso da nova medição na EMA do ângulo de mira. Alto para acompanhar a mirada ao vivo. */
+    var aimSmoothing: Float = 0.65f
 
-    /** Frames consecutivos que uma bola precisa aparecer para ser desenhada. */
-    var ballPersistenceFrames: Int = 2
+    /** Frames consecutivos que uma bola precisa aparecer para ser desenhada (1 = imediato). */
+    var ballPersistenceFrames: Int = 1
 
     /** Frames que uma bola some antes de ser descartada do tracker. */
     var ballMaxMissFrames: Int = 6

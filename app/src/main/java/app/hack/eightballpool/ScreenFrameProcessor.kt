@@ -589,9 +589,12 @@ object ScreenFrameProcessor {
     }
 
     /**
-     * Lê a linha de mira branca que o jogo 8 Ball Pool desenha a partir da bola branca.
-     * Coleta pixels brancos num anel ao redor da branca (antes de a linha ramificar para
-     * as caçapas) e obtém a direção por PCA.
+     * Lê a linha de mira branca que o jogo 8 Ball Pool desenha, por SCAN RADIAL:
+     * dispara raios da bola branca em todas as direções e mede o comprimento da
+     * sequência branca em cada uma; a mais longa é a linha-guia do jogo.
+     *
+     * Robusto e em tempo real: acompanha a mira enquanto você aponta, e a direção
+     * é exatamente a que o jogo mostra (sem recalcular física).
      */
     private fun detectGameAimLine(white: TrackedBall, balls: List<TrackedBall>, matrix: AnalysisMatrix): GameAim? {
         val w = matrix.width
@@ -601,99 +604,82 @@ object ScreenFrameProcessor {
         val cyS = white.y / matrix.scaleY
         val rS = max(1.5f, white.radius / avgScale)
 
-        val annMin = DetectorConfig.aimLineAnnulusMin * rS
-        val annMax = DetectorConfig.aimLineAnnulusMax * rS
-        val annMin2 = annMin * annMin
-        val annMax2 = annMax * annMax
+        val startR = 1.3f * rS
+        val maxR = hypot(w.toDouble(), h.toDouble()).toFloat()
+        val minRun = DetectorConfig.guidelineMinRunBallFactor * rS
+        val maxGap = DetectorConfig.guidelineMaxGap
 
-        // Raios (em coords amostradas) das outras bolas, para excluir seus pixels brancos.
-        val ballCentersX = FloatArray(balls.size)
-        val ballCentersY = FloatArray(balls.size)
-        val ballR2 = FloatArray(balls.size)
-        for (i in balls.indices) {
-            ballCentersX[i] = balls[i].x / matrix.scaleX
-            ballCentersY[i] = balls[i].y / matrix.scaleY
-            val br = balls[i].radius / avgScale * 1.2f
-            ballR2[i] = br * br
-        }
+        var bestRun = 0f
+        var bestCos = 0f
+        var bestSin = 0f
 
-        val x0 = (cxS - annMax).toInt().coerceIn(0, w - 1)
-        val x1 = (cxS + annMax).toInt().coerceIn(0, w - 1)
-        val y0 = (cyS - annMax).toInt().coerceIn(0, h - 1)
-        val y1 = (cyS + annMax).toInt().coerceIn(0, h - 1)
+        val stepDeg = DetectorConfig.guidelineAngleStepDeg.coerceAtLeast(0.5f)
+        var angle = 0f
+        while (angle < 360f) {
+            val rad = Math.toRadians(angle.toDouble())
+            val dx = cos(rad).toFloat()
+            val dy = sin(rad).toFloat()
 
-        var n = 0
-        var sumX = 0.0; var sumY = 0.0
-        var sumXX = 0.0; var sumYY = 0.0; var sumXY = 0.0
-
-        for (y in y0..y1) {
-            for (x in x0..x1) {
-                val ddx = x - cxS
-                val ddy = y - cyS
-                val d2 = ddx * ddx + ddy * ddy
-                if (d2 < annMin2 || d2 > annMax2) continue
-
-                val idx = y * w + x
-                if (matrix.value[idx] < DetectorConfig.aimLineMinValue) continue
-                if (matrix.sat[idx] > DetectorConfig.aimLineMaxSat) continue
-
-                var inBall = false
-                for (i in balls.indices) {
-                    if (balls[i] === white) continue
-                    val bx = x - ballCentersX[i]
-                    val by = y - ballCentersY[i]
-                    if (bx * bx + by * by < ballR2[i]) { inBall = true; break }
+            var gap = 0
+            var lastWhite = 0f
+            var r = startR
+            while (r < maxR) {
+                val xi = (cxS + dx * r).toInt()
+                val yi = (cyS + dy * r).toInt()
+                if (xi < 0 || xi >= w || yi < 0 || yi >= h) break
+                if (isWhiteNear(matrix, xi, yi)) {
+                    lastWhite = r
+                    gap = 0
+                } else {
+                    gap++
+                    if (gap > maxGap) break
                 }
-                if (inBall) continue
-
-                n++
-                sumX += x; sumY += y
-                sumXX += (x * x).toDouble(); sumYY += (y * y).toDouble(); sumXY += (x * y).toDouble()
+                r += 1f
             }
+            val run = lastWhite - startR
+            if (run > bestRun) {
+                bestRun = run
+                bestCos = dx
+                bestSin = dy
+            }
+            angle += stepDeg
         }
 
-        if (n < DetectorConfig.aimLineMinPixels) return null
+        if (bestRun < minRun) return null
 
-        val mx = sumX / n
-        val my = sumY / n
-        val covXX = (sumXX / n - mx * mx).toFloat()
-        val covYY = (sumYY / n - my * my).toFloat()
-        val covXY = (sumXY / n - mx * my).toFloat()
-
-        val trace = covXX + covYY
-        val det = covXX * covYY - covXY * covXY
-        val disc = trace * trace / 4f - det
-        if (disc < 0f) return null
-        val root = sqrt(disc)
-        val l1 = trace / 2f + root
-        val l2 = (trace / 2f - root).coerceAtLeast(1e-4f)
-        if (l1 <= 1e-4f) return null
-
-        var ex: Float
-        var ey: Float
-        if (abs(covXY) > 1e-5f) { ex = l1 - covYY; ey = covXY } else {
-            if (covXX >= covYY) { ex = 1f; ey = 0f } else { ex = 0f; ey = 1f }
-        }
-        val en = hypot(ex.toDouble(), ey.toDouble()).toFloat()
-        if (en < 1e-4f) return null
-        ex /= en; ey /= en
-
-        // Orienta para longe da bola branca (a linha se estende para frente).
-        val ox = (mx - cxS).toFloat()
-        val oy = (my - cyS).toFloat()
-        val sign = if (ox * ex + oy * ey >= 0f) 1f else -1f
-        var aimX = ex * sign * matrix.scaleX
-        var aimY = ey * sign * matrix.scaleY
+        var aimX = bestCos * matrix.scaleX
+        var aimY = bestSin * matrix.scaleY
         val an = hypot(aimX.toDouble(), aimY.toDouble()).toFloat()
         if (an < 1e-4f) return null
         aimX /= an; aimY /= an
 
-        val elongation = sqrt(l1 / l2)
-        val countScore = ((n - DetectorConfig.aimLineMinPixels) / 24f).coerceIn(0f, 1f)
-        val elongScore = ((elongation - 2f) / 6f).coerceIn(0f, 1f)
-        val confidence = (0.45f + 0.35f * countScore + 0.20f * elongScore).coerceIn(0.45f, 0.95f)
-
+        val confidence = (0.5f + 0.45f * (bestRun / (12f * rS))).coerceIn(0.5f, 0.95f)
         return GameAim(aimX, aimY, confidence)
+    }
+
+    /** Branco = valor alto e saturação baixa; checa vizinhança 3x3 para pegar linhas finas. */
+    private fun isWhiteNear(matrix: AnalysisMatrix, x: Int, y: Int): Boolean {
+        val w = matrix.width
+        val h = matrix.height
+        val minVal = DetectorConfig.aimLineMinValue
+        val maxSat = DetectorConfig.aimLineMaxSat
+        var dy = -1
+        while (dy <= 1) {
+            val yy = y + dy
+            if (yy in 0 until h) {
+                var dx = -1
+                while (dx <= 1) {
+                    val xx = x + dx
+                    if (xx in 0 until w) {
+                        val idx = yy * w + xx
+                        if (matrix.value[idx] >= minVal && matrix.sat[idx] <= maxSat) return true
+                    }
+                    dx++
+                }
+            }
+            dy++
+        }
+        return false
     }
 
     private fun bestAlignedBall(
