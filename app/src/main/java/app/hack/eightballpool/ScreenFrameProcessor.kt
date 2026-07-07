@@ -66,6 +66,8 @@ object ScreenFrameProcessor {
     private var nextBallId = 1
     private var frameCounter = 0L
     private var pixelBuffer = IntArray(0)
+    private var autoClothHue = 200f
+    private var autoClothGray = false
     private var smoothedAimAngle: Float? = null
     private var smoothedAimConfidence: Float = 0f
     private var smoothedAimOriginX: Float = 0f
@@ -121,7 +123,7 @@ object ScreenFrameProcessor {
         statMode = "-"; statCutDeg = -1f; statCueBounces = 0; statTargetBounces = 0
         val matrix = buildAnalysisMatrix(bitmap)
         val table = segmentTable(matrix)
-        val clothPct = clothFraction(matrix, segmentPrepared = true)
+        val clothPct = clothFraction(matrix)
 
         val indicators = ArrayList<VisualIndicator>()
         var ballsCount = 0
@@ -188,7 +190,10 @@ object ScreenFrameProcessor {
         val text = buildString {
             append("DEBUG 8BP  frame ${frameCounter % 100000}\n")
             append("captura: OK ($res)  giro: ${DetectorConfig.captureRotationDeg}°\n")
-            append("perfil: ${DetectorConfig.clothProfile}  pano: ${(clothPct * 100).toInt()}%\n")
+            val panoCor = if (DetectorConfig.clothProfile == DetectorConfig.ClothProfile.AUTO) {
+                if (autoClothGray) "AUTO cinza" else "AUTO h=${autoClothHue.toInt()}°"
+            } else DetectorConfig.clothProfile.toString()
+            append("perfil: $panoCor  pano: ${(clothPct * 100).toInt()}%\n")
             append("mesa: ${if (tableFound) "SIM" else "NAO (ajustar HSV azul)"}\n")
             append("bolas: $balls   branca: ${if (cue) "SIM" else "NAO"}\n")
             append("mira: ${if (aim) "SIM (${(smoothedAimConfidence * 100).toInt()}%)" else "NAO"}\n")
@@ -204,19 +209,11 @@ object ScreenFrameProcessor {
         )
     }
 
-    /** Fração de pixels que casam com o perfil de pano (para o HUD/calibração). */
-    private fun clothFraction(matrix: AnalysisMatrix, segmentPrepared: Boolean): Float {
-        if (segmentPrepared && matrix.cloth.isNotEmpty()) {
-            var c = 0
-            for (v in matrix.cloth) if (v) c++
-            return c.toFloat() / matrix.size
-        }
-        val profile = if (DetectorConfig.clothProfile == DetectorConfig.ClothProfile.AUTO)
-            chooseProfile(matrix) else DetectorConfig.clothProfile
+    /** Fração de pixels marcados como pano na máscara já calculada (para o HUD/calibração). */
+    private fun clothFraction(matrix: AnalysisMatrix): Float {
+        if (matrix.cloth.isEmpty()) return 0f
         var c = 0
-        for (i in 0 until matrix.size) {
-            if (matchesProfile(profile, matrix.hue[i], matrix.sat[i], matrix.value[i])) c++
-        }
+        for (v in matrix.cloth) if (v) c++
         return c.toFloat() / matrix.size
     }
 
@@ -294,14 +291,19 @@ object ScreenFrameProcessor {
     // =====================================================================
 
     private fun segmentTable(matrix: AnalysisMatrix): TableRegion? {
-        val profile = chooseProfile(matrix)
+        val useAuto = DetectorConfig.clothProfile == DetectorConfig.ClothProfile.AUTO
+        if (useAuto) prepareAutoCloth(matrix)
+        val profile = if (useAuto) DetectorConfig.ClothProfile.AUTO else DetectorConfig.clothProfile
+
         val cloth = BooleanArray(matrix.size)
         var clothCount = 0
         for (i in 0 until matrix.size) {
-            if (matchesProfile(profile, matrix.hue[i], matrix.sat[i], matrix.value[i])) {
-                cloth[i] = true
-                clothCount++
+            val ok = if (useAuto) {
+                clothMatchAuto(matrix.hue[i], matrix.sat[i], matrix.value[i])
+            } else {
+                matchesProfile(profile, matrix.hue[i], matrix.sat[i], matrix.value[i])
             }
+            if (ok) { cloth[i] = true; clothCount++ }
         }
         matrix.cloth = cloth
 
@@ -335,25 +337,46 @@ object ScreenFrameProcessor {
         )
     }
 
-    private fun chooseProfile(matrix: AnalysisMatrix): DetectorConfig.ClothProfile {
-        if (DetectorConfig.clothProfile != DetectorConfig.ClothProfile.AUTO) {
-            return DetectorConfig.clothProfile
-        }
-        var green = 0
-        var blue = 0
-        var gray = 0
+    /**
+     * Detecta a cor do pano pela COR DOMINANTE do frame (histograma de matiz).
+     * Assim funciona com qualquer feltro (azul, verde, marrom, vinho, cinza) sem
+     * depender de faixas fixas. Guarda o resultado em [autoClothHue]/[autoClothGray].
+     */
+    private fun prepareAutoCloth(matrix: AnalysisMatrix) {
+        val bins = IntArray(36)
+        var grayCount = 0
         for (i in 0 until matrix.size) {
-            val hh = matrix.hue[i]
-            val ss = matrix.sat[i]
-            val vv = matrix.value[i]
-            if (matchesProfile(DetectorConfig.ClothProfile.GREEN, hh, ss, vv)) green++
-            if (matchesProfile(DetectorConfig.ClothProfile.BLUE, hh, ss, vv)) blue++
-            if (matchesProfile(DetectorConfig.ClothProfile.GRAY, hh, ss, vv)) gray++
+            val s = matrix.sat[i]
+            val v = matrix.value[i]
+            // Ignora pixels escuros (UI/fundo navy) e estourados: o feltro é de brilho médio.
+            if (v < 0.30f || v > 0.95f) continue
+            if (s >= 0.20f) {
+                val b = ((matrix.hue[i] / 10f).toInt()).coerceIn(0, 35)
+                bins[b]++
+            } else if (v in 0.35f..0.72f) {
+                grayCount++
+            }
         }
-        return when {
-            green >= blue && green >= gray -> DetectorConfig.ClothProfile.GREEN
-            blue >= green && blue >= gray -> DetectorConfig.ClothProfile.BLUE
-            else -> DetectorConfig.ClothProfile.GRAY
+        var maxBin = 0
+        var maxCount = 0
+        for (b in 0..35) if (bins[b] > maxCount) { maxCount = bins[b]; maxBin = b }
+
+        // Feltro colorido dominante vs feltro cinza (ex.: mesa cinza/preta).
+        if (maxCount >= grayCount && maxCount > matrix.size * 0.04f) {
+            autoClothGray = false
+            autoClothHue = maxBin * 10f + 5f
+        } else {
+            autoClothGray = true
+        }
+    }
+
+    private fun clothMatchAuto(h: Float, s: Float, v: Float): Boolean {
+        return if (autoClothGray) {
+            s <= 0.22f && v in 0.35f..0.74f
+        } else {
+            var d = abs(h - autoClothHue)
+            if (d > 180f) d = 360f - d
+            d <= 24f && s >= 0.16f && v in 0.26f..0.97f
         }
     }
 

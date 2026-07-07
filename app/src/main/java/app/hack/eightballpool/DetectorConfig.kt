@@ -31,11 +31,15 @@ object DetectorConfig {
      * paisagem; gire até as linhas baterem na mesa. As coordenadas de saída já saem
      * no espaço orientado (mesma da overlay em paisagem). Cicle pela notificação.
      */
-    var captureRotationDeg: Int = 90
+    var captureRotationDeg: Int = 0
 
     // ---- Segmentação da mesa ---------------------------------------------------
-    /** Padrão BLUE: o pano do jogo 8 Ball Pool é azul/ciano. Use AUTO/GREEN para mesa real. */
-    var clothProfile: ClothProfile = ClothProfile.BLUE
+    /**
+     * AUTO detecta o pano pela COR DOMINANTE do frame (funciona com feltro azul,
+     * verde, marrom, vinho, cinza — qualquer skin de mesa). Force GREEN/BLUE/GRAY
+     * só se quiser travar numa cor específica.
+     */
+    var clothProfile: ClothProfile = ClothProfile.AUTO
 
     // Faixas HSV por perfil. Hue em [0,360), sat/val em [0,1].
     var greenHueRange: ClosedFloatingPointRange<Float> = 80f..175f
