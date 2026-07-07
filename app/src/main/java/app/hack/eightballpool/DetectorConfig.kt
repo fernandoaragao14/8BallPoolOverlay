@@ -18,20 +18,25 @@ object DetectorConfig {
     enum class ClothProfile { AUTO, GREEN, BLUE, GRAY }
 
     // ---- Resolução de análise --------------------------------------------------
-    /** Maior lado da matriz de análise (px). Maior = mais preciso e mais lento. */
-    var maxAnalysisSide: Int = 480
+    /**
+     * Maior lado da matriz de análise (px). Maior = mais preciso e mais lento.
+     * 640 ajuda a preservar a linha de mira fina que o jogo 8 Ball Pool desenha.
+     */
+    var maxAnalysisSide: Int = 640
 
     // ---- Segmentação da mesa ---------------------------------------------------
-    var clothProfile: ClothProfile = ClothProfile.AUTO
+    /** Padrão BLUE: o pano do jogo 8 Ball Pool é azul/ciano. Use AUTO/GREEN para mesa real. */
+    var clothProfile: ClothProfile = ClothProfile.BLUE
 
     // Faixas HSV por perfil. Hue em [0,360), sat/val em [0,1].
     var greenHueRange: ClosedFloatingPointRange<Float> = 80f..175f
     var greenMinSat: Float = 0.22f
     var greenValRange: ClosedFloatingPointRange<Float> = 0.12f..0.96f
 
-    var blueHueRange: ClosedFloatingPointRange<Float> = 175f..245f
-    var blueMinSat: Float = 0.22f
-    var blueValRange: ClosedFloatingPointRange<Float> = 0.12f..0.96f
+    // Faixa alargada p/ ciano do jogo; valor mínimo maior exclui a UI azul-escura ao redor da mesa.
+    var blueHueRange: ClosedFloatingPointRange<Float> = 165f..250f
+    var blueMinSat: Float = 0.20f
+    var blueValRange: ClosedFloatingPointRange<Float> = 0.32f..0.99f
 
     /** Cinza: baixa saturação e valor médio (evita capturar as bolas brancas, que têm val alto). */
     var grayMaxSat: Float = 0.20f
@@ -60,6 +65,21 @@ object DetectorConfig {
     // ---- Bola branca (principal) ----------------------------------------------
     var cueBallMinValue: Float = 0.70f
     var cueBallMaxSat: Float = 0.30f
+
+    // ---- Linha de mira do jogo (8 Ball Pool) -----------------------------------
+    /** Ler a linha branca de mira que o próprio jogo desenha a partir da bola branca. */
+    var readGameAimLine: Boolean = true
+
+    /** Pixel "branco" da linha: valor alto e saturação baixa. */
+    var aimLineMinValue: Float = 0.78f
+    var aimLineMaxSat: Float = 0.22f
+
+    /** Anel (em raios de bola) ao redor da branca onde a direção da linha é medida (antes de ramificar). */
+    var aimLineAnnulusMin: Float = 1.25f
+    var aimLineAnnulusMax: Float = 6.0f
+
+    /** Pixels brancos mínimos (na matriz) para aceitar a linha de mira. */
+    var aimLineMinPixels: Int = 6
 
     // ---- Detecção do taco ------------------------------------------------------
     /** Raio de busca do taco ao redor da bola principal, em múltiplos do raio da bola. */
@@ -99,6 +119,9 @@ object DetectorConfig {
     var minAimConfidence: Float = 0.30f
 
     // ---- Debug -----------------------------------------------------------------
-    /** Desenha caixas/pontos de diagnóstico (mesa bruta, candidatos, eixo do taco). */
-    var debugOverlay: Boolean = false
+    /**
+     * Desenha caixas/pontos de diagnóstico (mesa bruta, candidatos, eixo da mira).
+     * Ligado por padrão nesta versão de calibração — desligue depois de afinar.
+     */
+    var debugOverlay: Boolean = true
 }
