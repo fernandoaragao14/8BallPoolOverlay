@@ -1,7 +1,9 @@
 package app.hack.eightballpool
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -11,87 +13,88 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 
-
 class MainActivity : AppCompatActivity() {
 
     private val TAG = "MainActivity"
-    private val gamePackage = "com.miniclip.eightballpool"
+    private var captureConsentRequested = false
 
-    private val requestPermissionLauncher =
+    private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val screenCaptureConsentLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+                Log.d(TAG, "Screen capture consent granted")
+                startIndicatorOverlayService()
+                startScreenCaptureService(result.resultCode, result.data!!)
+            } else {
+                Log.w(TAG, "Screen capture consent denied")
+                captureConsentRequested = false
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Log.d(TAG, "onCreate")
         super.onCreate(savedInstanceState)
 
-        getNotificationPermission()
-        getDeviceDimensions()
+        requestNotificationPermissionIfNeeded()
+        logDeviceDimensions()
     }
 
     override fun onResume() {
         Log.d(TAG, "onResume")
         super.onResume()
 
-        if (Settings.canDrawOverlays(this)) {
-            Log.d(TAG, "hasPermission")
-            launch()
-        } else {
-            Log.d(TAG, "getPermission")
-            val permissionIntent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")
-            )
-            startActivity(permissionIntent)
-        }
-    }
-
-    private fun getDeviceDimensions() {
-        val metrics = resources.displayMetrics;
-        val deviceWidth = metrics.widthPixels
-        val deviceHeight = metrics.heightPixels
-        Log.d(TAG, "Device Width: $deviceWidth")
-        Log.d(TAG, "Device Height: $deviceHeight")
-    }
-
-    private fun launch() {
-        Log.d(TAG, "launch")
-        val gameIntent = packageManager.getLaunchIntentForPackage(gamePackage)
-        if (intent == null) {
-            launchPlayStore()
-        } else {
-            Log.d(TAG, "launchGame")
-            val serviceIntent = Intent(this, OverlayService::class.java)
-            serviceIntent.setAction(OverlayService.ACTION_START_SERVICE)
-            ContextCompat.startForegroundService(
-                this, serviceIntent
-            )
-
-            gameIntent?.flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            runCatching { startActivity(gameIntent) }.onFailure {
-                Log.e(TAG, "launchGame", it)
-            }
-        }
-        finish()
-    }
-
-
-    private fun launchPlayStore() {
-        Log.d(TAG, "launchPlayStore")
-        val playStoreUri = "https://play.google.com/store/apps/details?id=$gamePackage"
-        val playStoreIntent = Intent(Intent.ACTION_VIEW).apply {
-            data = Uri.parse(playStoreUri)
-            setPackage("com.android.vending")
+        if (!Settings.canDrawOverlays(this)) {
+            requestOverlayPermission()
+            return
         }
 
-        runCatching { startActivity(playStoreIntent) }.onFailure {
-            Log.e(
-                TAG, "launchPlayStore", it
-            )
-        }
+        requestScreenCaptureConsentIfNeeded()
     }
 
-    private fun getNotificationPermission() {
+    private fun requestOverlayPermission() {
+        Log.d(TAG, "requestOverlayPermission")
+        val permissionIntent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName")
+        )
+        startActivity(permissionIntent)
+    }
+
+    private fun requestScreenCaptureConsentIfNeeded() {
+        if (captureConsentRequested) return
+
+        captureConsentRequested = true
+        val projectionManager = getSystemService(MediaProjectionManager::class.java)
+        val consentIntent = projectionManager.createScreenCaptureIntent()
+        screenCaptureConsentLauncher.launch(consentIntent)
+    }
+
+    private fun startScreenCaptureService(resultCode: Int, resultData: Intent) {
+        Log.d(TAG, "startScreenCaptureService")
+        val serviceIntent = Intent(this, ScreenCaptureService::class.java).apply {
+            action = ScreenCaptureService.ACTION_START_CAPTURE
+            putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, resultData)
+        }
+        ContextCompat.startForegroundService(this, serviceIntent)
+    }
+
+    private fun startIndicatorOverlayService() {
+        Log.d(TAG, "startIndicatorOverlayService")
+        IndicatorOverlayService.start(this)
+    }
+
+    private fun logDeviceDimensions() {
+        val metrics = resources.displayMetrics
+        Log.d(TAG, "Device Width: ${metrics.widthPixels}")
+        Log.d(TAG, "Device Height: ${metrics.heightPixels}")
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requestPermissionLauncher.launch(
+            notificationPermissionLauncher.launch(
                 Manifest.permission.POST_NOTIFICATIONS
             )
         }
