@@ -120,12 +120,21 @@ object DetectorConfig {
     /** Folga extra (em raios de bola) exigida para considerar um caminho "livre" de obstáculos. */
     var pathClearanceBallFactor: Float = 0.4f
 
-    // ---- Trajetória ------------------------------------------------------------
-    /** Quantas rebatidas na tabela desenhar depois do primeiro impacto na borda. */
-    var maxRailReflections: Int = 1
+    // ---- Trajetória / física 2D ------------------------------------------------
+    /** Nº máximo de ricochetes nas tabelas projetados por caminho (branca e bola-alvo). */
+    var maxRailReflections: Int = 3
 
-    /** Desenhar a deflexão aproximada da branca após bater em outra bola. */
+    /** Restituição por batida na tabela (energia retida). 1.0 = sem perda; < 1 encurta/apaga. */
+    var railRestitution: Float = 0.78f
+
+    /** Orçamento de comprimento do caminho, em múltiplos da diagonal da mesa (energia inicial). */
+    var pathEnergyDiagonals: Float = 1.7f
+
+    /** Desenhar a deflexão da branca (tangente 90°) após colisão elástica com a bola. */
     var drawCueDeflection: Boolean = true
+
+    /** Desenhar a linha-guia de alinhamento total (eixo do taco estendido de ponta a ponta). */
+    var drawAlignmentGuide: Boolean = true
 
     // ---- Suavização temporal ---------------------------------------------------
     /** Peso da nova medição na EMA de posição (0..1). Maior = segue mais rápido a mira. */

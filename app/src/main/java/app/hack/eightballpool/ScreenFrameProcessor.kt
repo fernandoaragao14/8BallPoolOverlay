@@ -70,6 +70,12 @@ object ScreenFrameProcessor {
     private var smoothedAimOriginX: Float = 0f
     private var smoothedAimOriginY: Float = 0f
 
+    // Estatísticas do último cálculo vetorial (para o HUD).
+    private var statMode: String = "-"
+    private var statCutDeg: Float = -1f
+    private var statCueBounces: Int = 0
+    private var statTargetBounces: Int = 0
+
     fun submit(bitmap: Bitmap) {
         val previous = synchronized(this) {
             val old = latestBitmap
@@ -111,6 +117,7 @@ object ScreenFrameProcessor {
 
     private fun detectAndPublish(bitmap: Bitmap) {
         frameCounter++
+        statMode = "-"; statCutDeg = -1f; statCueBounces = 0; statTargetBounces = 0
         val matrix = buildAnalysisMatrix(bitmap)
         val table = segmentTable(matrix)
         val clothPct = clothFraction(matrix, segmentPrepared = true)
@@ -184,6 +191,8 @@ object ScreenFrameProcessor {
             append("mesa: ${if (tableFound) "SIM" else "NAO (ajustar HSV azul)"}\n")
             append("bolas: $balls   branca: ${if (cue) "SIM" else "NAO"}\n")
             append("mira: ${if (aim) "SIM (${(smoothedAimConfidence * 100).toInt()}%)" else "NAO"}\n")
+            val cut = if (statCutDeg >= 0f) "${statCutDeg.roundToInt()}°" else "-"
+            append("fisica: alvo=${statMode} corte=$cut ric(alvo=$statTargetBounces branca=$statCueBounces)\n")
             append("auto: ${if (DetectorConfig.opportunityMode) "ON" else "OFF"}")
         }
         return VisualIndicator(
@@ -776,115 +785,167 @@ object ScreenFrameProcessor {
         val dy = play.aimY
         if (dx == 0f && dy == 0f) return out
 
+        val diagonal = hypot((table.right - table.left).toDouble(), (table.bottom - table.top).toDouble()).toFloat()
+        val energy = diagonal * DetectorConfig.pathEnergyDiagonals
         val others = balls.filter { it !== main }
 
-        // 1ª colisão com bola.
+        // Linha-guia de alinhamento total: eixo do taco estendido de ponta a ponta.
+        if (DetectorConfig.drawAlignmentGuide) {
+            val axisEnd = rayRect(ox, oy, dx, dy, table, 0f)
+            val ax = if (axisEnd != null) ox + dx * axisEnd.t else ox + dx * diagonal
+            val ay = if (axisEnd != null) oy + dy * axisEnd.t else oy + dy * diagonal
+            out += lineIndicator(ox, oy, ax, ay, withAlpha(aimColor, 70), 3f, dashed = true)
+        }
+
+        // 1ª colisão: bola x tabela.
         var ballHitT = Float.MAX_VALUE
         var hitBall: TrackedBall? = null
         for (b in others) {
             val t = rayCircle(ox, oy, dx, dy, b.x, b.y, main.radius + b.radius)
-            if (t != null && t < ballHitT) {
-                ballHitT = t
-                hitBall = b
-            }
+            if (t != null && t < ballHitT) { ballHitT = t; hitBall = b }
         }
-
-        // 1ª colisão com a tabela (centro a `radius` da borda).
         val railHit = rayRect(ox, oy, dx, dy, table, main.radius)
-
         val ballFirst = hitBall != null && ballHitT <= (railHit?.t ?: Float.MAX_VALUE)
 
         if (ballFirst && hitBall != null) {
             val contactX = ox + dx * ballHitT
             val contactY = oy + dy * ballHitT
-            out += lineIndicator(ox, oy, contactX, contactY, aimColor, 9f, arrow = false, label = "Mira")
+            out += lineIndicator(ox, oy, contactX, contactY, aimColor, 9f, label = "Mira")
 
-            // Ponto de impacto (onde as bolas se tocam).
+            // Linha de centros (bola-alvo sai por aqui — colisão elástica de esferas rígidas).
             var ux = hitBall.x - contactX
             var uy = hitBall.y - contactY
             val un = hypot(ux.toDouble(), uy.toDouble()).toFloat()
             if (un > 1e-3f) { ux /= un; uy /= un }
+
+            // Ângulo de corte entre a mira e a linha de centros.
+            val cutCos = (dx * ux + dy * uy).coerceIn(-1f, 1f)
+            val cutDeg = Math.toDegrees(acos(cutCos.toDouble())).toFloat()
+            statCutDeg = cutDeg
+            statMode = "bola"
+
             val touchX = contactX + ux * main.radius
             val touchY = contactY + uy * main.radius
             out += VisualIndicator(
                 shape = VisualIndicatorShape.MARKER,
-                x = touchX, y = touchY, radius = 12f, color = impactColor, label = "Impacto"
+                x = touchX, y = touchY, radius = 12f, color = impactColor,
+                label = "Impacto • corte ${cutDeg.roundToInt()}°"
             )
-            // Ghost ball (posição da branca no impacto).
             out += VisualIndicator(
                 shape = VisualIndicatorShape.CIRCLE,
                 x = contactX, y = contactY, radius = main.radius,
                 color = withAlpha(aimColor, 130), strokeWidth = 4f
             )
 
-            // Caminho provável da bola alvo até a tabela (+1 rebatida).
-            val targetRail = rayRect(hitBall.x, hitBall.y, ux, uy, table, hitBall.radius)
-            if (targetRail != null) {
-                val tx = hitBall.x + ux * targetRail.t
-                val ty = hitBall.y + uy * targetRail.t
-                out += lineIndicator(hitBall.x, hitBall.y, tx, ty, targetPathColor, 8f, arrow = true, dashed = true)
-                addRailBounces(out, tx, ty, ux, uy, targetRail.normalX, targetRail.normalY, table, hitBall.radius, targetPathColor)
-            } else {
-                out += lineIndicator(hitBall.x, hitBall.y, hitBall.x + ux * 400f, hitBall.y + uy * 400f, targetPathColor, 8f, arrow = true, dashed = true)
-            }
+            // Reparte a energia pela física elástica: alvo ∝ cos(θ), branca ∝ sen(θ).
+            val targetEnergy = energy * cutCos.coerceIn(0f, 1f)
+            val cueEnergy = energy * sqrt((1f - cutCos * cutCos).coerceIn(0f, 1f))
 
-            // Deflexão aproximada da branca (perpendicular à linha de impacto).
-            if (DetectorConfig.drawCueDeflection) {
-                var tvx = dx - (dx * ux + dy * uy) * ux
-                var tvy = dy - (dx * ux + dy * uy) * uy
+            // Bola-alvo: linha de centros, com múltiplos ricochetes e perda de energia.
+            statTargetBounces = tracePath(out, hitBall.x, hitBall.y, ux, uy, table, hitBall.radius, targetEnergy, targetPathColor, 8f)
+            // Caçapa mais provável para a bola-alvo.
+            highlightProbablePocket(out, hitBall.x, hitBall.y, ux, uy, table)?.let { out += it }
+
+            // Branca: tangente 90° (deflexão elástica), também com ricochetes.
+            if (DetectorConfig.drawCueDeflection && cueEnergy > main.radius) {
+                var tvx = dx - cutCos * ux
+                var tvy = dy - cutCos * uy
                 val tvn = hypot(tvx.toDouble(), tvy.toDouble()).toFloat()
                 if (tvn > 1e-3f) {
                     tvx /= tvn; tvy /= tvn
-                    val len = main.radius * 4f
-                    out += lineIndicator(contactX, contactY, contactX + tvx * len, contactY + tvy * len, cueDeflectColor, 5f, arrow = true, dashed = true)
+                    statCueBounces = tracePath(out, contactX, contactY, tvx, tvy, table, main.radius, cueEnergy, cueDeflectColor, 5f)
                 }
+            } else {
+                statCueBounces = 0
             }
         } else if (railHit != null) {
             val ix = ox + dx * railHit.t
             val iy = oy + dy * railHit.t
-            out += lineIndicator(ox, oy, ix, iy, aimColor, 9f, arrow = false, label = "Mira")
+            statMode = "tabela"
+            statCutDeg = -1f
+            statCueBounces = 0
+            out += lineIndicator(ox, oy, ix, iy, aimColor, 9f, label = "Mira")
             out += VisualIndicator(
                 shape = VisualIndicatorShape.MARKER,
                 x = ix, y = iy, radius = 12f, color = impactColor, label = "Tabela"
             )
-            addRailBounces(out, ix, iy, dx, dy, railHit.normalX, railHit.normalY, table, main.radius, railBounceColor)
+            val reflected = reflect(dx, dy, railHit.normalX, railHit.normalY)
+            val remaining = (energy - railHit.t).coerceAtLeast(0f) * DetectorConfig.railRestitution
+            statTargetBounces = 1 + tracePath(out, ix, iy, reflected.first, reflected.second, table, main.radius, remaining, railBounceColor, 7f)
         }
 
         return out
     }
 
-    private fun addRailBounces(
+    /**
+     * Traça um caminho com múltiplos ricochetes nas tabelas, gastando um orçamento de
+     * energia ([budget] em px). A cada batida a energia é multiplicada por [railRestitution]
+     * (perda cinética nominal) e a linha fica mais fraca. Retorna o nº de ricochetes desenhados.
+     */
+    private fun tracePath(
         out: ArrayList<VisualIndicator>,
-        startX: Float,
-        startY: Float,
-        inX: Float,
-        inY: Float,
-        normalX: Float,
-        normalY: Float,
-        table: TableRegion,
-        radius: Float,
-        color: Int
-    ) {
+        startX: Float, startY: Float, dirXin: Float, dirYin: Float,
+        table: TableRegion, radius: Float, budget: Float, color: Int, width: Float
+    ): Int {
         var px = startX
         var py = startY
-        val firstReflected = reflect(inX, inY, normalX, normalY)
-        var dirX = firstReflected.first
-        var dirY = firstReflected.second
+        var dirX = dirXin
+        var dirY = dirYin
+        var remaining = budget
+        var bounce = 0
+        val minLen = radius * 0.8f
 
-        var bounces = 0
-        while (bounces < DetectorConfig.maxRailReflections) {
-            val hit = rayRect(px, py, dirX, dirY, table, radius) ?: run {
-                out += lineIndicator(px, py, px + dirX * 400f, py + dirY * 400f, color, 7f, arrow = true, dashed = true)
-                return
+        while (remaining > minLen && bounce <= DetectorConfig.maxRailReflections) {
+            val hit = rayRect(px, py, dirX, dirY, table, radius)
+            val alpha = (235f * pow(DetectorConfig.railRestitution, bounce)).toInt().coerceIn(60, 235)
+            val segColor = withAlpha(color, alpha)
+
+            if (hit == null || hit.t >= remaining) {
+                // A bola perde a energia antes de alcançar a próxima tabela: para aqui.
+                out += lineIndicator(px, py, px + dirX * remaining, py + dirY * remaining, segColor, width, arrow = true, dashed = true)
+                return bounce
             }
             val nx = px + dirX * hit.t
             val ny = py + dirY * hit.t
-            out += lineIndicator(px, py, nx, ny, color, 7f, arrow = true, dashed = true)
+            out += lineIndicator(px, py, nx, ny, segColor, width, arrow = false, dashed = true)
+
             val reflected = reflect(dirX, dirY, hit.normalX, hit.normalY)
             px = nx; py = ny
             dirX = reflected.first; dirY = reflected.second
-            bounces++
+            remaining = (remaining - hit.t) * DetectorConfig.railRestitution
+            bounce++
         }
+        return bounce
+    }
+
+    /** Destaca a caçapa cujo eixo mais se alinha com a direção da bola-alvo (à frente dela). */
+    private fun highlightProbablePocket(
+        out: ArrayList<VisualIndicator>,
+        bx: Float, by: Float, ux: Float, uy: Float, table: TableRegion
+    ): VisualIndicator? {
+        var best: FloatArray? = null
+        var bestPerp = Float.MAX_VALUE
+        for (p in tablePockets(table)) {
+            val rx = p[0] - bx
+            val ry = p[1] - by
+            val proj = rx * ux + ry * uy
+            if (proj <= 0f) continue
+            val perp = abs(rx * (-uy) + ry * ux)
+            if (perp < bestPerp) { bestPerp = perp; best = p }
+        }
+        val pocket = best ?: return null
+        // Só marca se estiver razoavelmente alinhada (dentro de ~1.5 diâmetro de bola).
+        return VisualIndicator(
+            shape = VisualIndicatorShape.CIRCLE,
+            x = pocket[0], y = pocket[1], radius = (table.right - table.left) * DetectorConfig.pocketRadiusFraction,
+            color = bestTargetColor, strokeWidth = 6f, label = "Caçapa"
+        )
+    }
+
+    private fun pow(base: Float, exp: Int): Float {
+        var r = 1f
+        repeat(exp) { r *= base }
+        return r
     }
 
     // ---- Interseções -----------------------------------------------------------
