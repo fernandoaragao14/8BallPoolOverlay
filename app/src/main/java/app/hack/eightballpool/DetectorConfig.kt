@@ -130,13 +130,17 @@ object DetectorConfig {
 
     // ---- Trajetória / física 2D ------------------------------------------------
     /** Nº máximo de ricochetes nas tabelas projetados por caminho (branca e bola-alvo). */
-    var maxRailReflections: Int = 3
+    var maxRailReflections: Int = 4
 
-    /** Restituição por batida na tabela (energia retida). 1.0 = sem perda; < 1 encurta/apaga. */
-    var railRestitution: Float = 0.78f
+    /**
+     * Restituição por batida na tabela (energia retida). 1.0 = sem perda.
+     * Alto (~0.9) para linhas longas cruzando a mesa de ponta a ponta, como nas
+     * guias estendidas de referência; menor para simular perda cinética real.
+     */
+    var railRestitution: Float = 0.90f
 
     /** Orçamento de comprimento do caminho, em múltiplos da diagonal da mesa (energia inicial). */
-    var pathEnergyDiagonals: Float = 1.7f
+    var pathEnergyDiagonals: Float = 3.2f
 
     /** Desenhar a deflexão da branca (tangente 90°) após colisão elástica com a bola. */
     var drawCueDeflection: Boolean = true

@@ -922,12 +922,12 @@ object ScreenFrameProcessor {
 
             if (hit == null || hit.t >= remaining) {
                 // A bola perde a energia antes de alcançar a próxima tabela: para aqui.
-                out += lineIndicator(px, py, px + dirX * remaining, py + dirY * remaining, segColor, width, arrow = true, dashed = true)
+                out += lineIndicator(px, py, px + dirX * remaining, py + dirY * remaining, segColor, width, arrow = true)
                 return bounce
             }
             val nx = px + dirX * hit.t
             val ny = py + dirY * hit.t
-            out += lineIndicator(px, py, nx, ny, segColor, width, arrow = false, dashed = true)
+            out += lineIndicator(px, py, nx, ny, segColor, width)
 
             val reflected = reflect(dirX, dirY, hit.normalX, hit.normalY)
             px = nx; py = ny
